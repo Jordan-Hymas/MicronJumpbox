@@ -1,0 +1,4 @@
+# Jumpbox runtime dependencies (pinned for reproducible deploys).
+# Install with:  pip install -r requirements.txt
+textual==8.2.7
+rich==15.0.0

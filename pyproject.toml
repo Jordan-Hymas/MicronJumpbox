@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jumpbox"
+version = "0.1.0"
+description = "Terminal SSH jump host built with Textual + Rich"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Micron Technologies" }]
+dependencies = [
+    "textual>=8.0,<9",
+    "rich>=14,<16",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
+# This is what makes `jumpbox` a runnable command after install.
+[project.scripts]
+jumpbox = "jumpbox.__main__:main"
+
+[tool.setuptools]
+packages = ["jumpbox"]
+
+[tool.setuptools.package-data]
+jumpbox = ["styles.tcss"]

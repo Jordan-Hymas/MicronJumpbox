@@ -1,0 +1,228 @@
+/* Jumpbox dashboard styling */
+
+Screen {
+    background: $background;
+}
+
+/* Textual's own Button default is min-width: 16, which pads every button
+   out far past its label. Zero it so every button hugs its own content -
+   the smallest possible size, with guaranteed-even centering. */
+Button {
+    min-width: 0;
+}
+
+/* ---- top bar --------------------------------------------------------- */
+#topbar {
+    height: auto;
+    align-horizontal: right;
+    padding: 0 2;
+}
+
+/* ---- banner -------------------------------------------------------- */
+#banner-wrap {
+    height: auto;
+    align-horizontal: center;
+    padding-top: 0;
+}
+
+#banner {
+    width: auto;
+    color: $accent;
+    text-style: bold;
+}
+
+#subtitle {
+    width: auto;
+    color: $text-muted;
+    text-style: italic;
+    padding: 0;
+}
+
+/* ---- tabs ------------------------------------------------------------ */
+#tabs {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 0;
+    height: 1fr;
+}
+
+/* ---- body / panes -------------------------------------------------- */
+#body {
+    height: 1fr;
+    padding: 0 2 1 2;
+}
+
+#locations-pane {
+    width: 44;
+    height: 1fr;
+    border: round $primary;
+    border-title-color: $accent;
+    border-title-align: left;
+    padding: 1;
+    margin-right: 2;
+}
+
+#hosts-pane {
+    width: 1fr;
+    height: 1fr;
+    border: round $primary;
+    border-title-color: $accent;
+    border-title-align: left;
+    padding: 1;
+}
+
+#locations, #hosts {
+    height: 1fr;
+    background: transparent;
+    border: none;
+    padding: 0;
+    overflow-y: auto;
+}
+
+Tree {
+    background: transparent;
+}
+
+Input {
+    margin-bottom: 1;
+    border: tall $primary 60%;
+}
+Input:focus {
+    border: tall $accent;
+}
+
+#location-toolbar, #host-toolbar {
+    height: auto;
+}
+
+#location-toolbar Input, #host-toolbar Input {
+    width: 1fr;
+}
+
+.kebab-btn {
+    margin-left: 1;
+}
+
+.host-item {
+    height: auto;
+    padding: 0;
+    margin-bottom: 0;
+}
+
+ListView > ListItem.-highlight {
+    background: $accent 25%;
+}
+ListView:focus > ListItem.-highlight {
+    background: $accent 50%;
+}
+
+/* ---- detail strip ---------------------------------------------------
+   Deliberately quiet: a thin separator, not a boxed card, so the lists
+   above keep most of the vertical space. */
+#detail {
+    height: auto;
+    min-height: 3;
+    border-top: solid $primary 35%;
+    border-title-color: $text-muted;
+    border-title-align: left;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+#detail-body {
+    height: auto;
+    color: $text-muted;
+}
+
+#actions {
+    height: auto;
+    align-horizontal: right;
+    margin-top: 1;
+}
+
+#actions Button {
+    margin-left: 1;
+}
+
+/* ---- logs tab ------------------------------------------------------- */
+#logs-pane {
+    height: 1fr;
+    padding: 1 2;
+}
+
+#logs-caption {
+    height: auto;
+    color: $text-muted;
+    padding-bottom: 1;
+}
+
+#log-list {
+    height: 1fr;
+    background: transparent;
+    border: round $primary;
+    padding: 1;
+    overflow-y: auto;
+}
+
+.log-item {
+    height: auto;
+    padding: 0;
+    margin-bottom: 0;
+}
+
+#log-actions {
+    height: auto;
+    align-horizontal: right;
+    margin-top: 1;
+}
+
+/* ---- modal dialogs (menus, confirm, add-forms) ----------------------- */
+ModalScreen {
+    align: center middle;
+}
+
+.dialog-box {
+    width: 42;
+    height: auto;
+    background: $panel;
+    border: round $accent;
+    padding: 1 2;
+}
+
+.dialog-title {
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+.field-label {
+    color: $text-muted;
+    height: 1;
+}
+
+.dialog-box Input {
+    margin-bottom: 1;
+}
+
+#form-error {
+    height: 1;
+    margin-bottom: 1;
+}
+
+.dialog-actions {
+    height: auto;
+    align-horizontal: right;
+}
+
+.dialog-actions Button {
+    margin-left: 1;
+}
+
+#menu-box {
+    align-horizontal: center;
+}
+
+.menu-option {
+    margin-bottom: 1;
+}
