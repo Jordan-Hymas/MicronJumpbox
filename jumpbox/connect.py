@@ -1,106 +1,54 @@
-"""Launching SSH sessions on Linux.
+"""Building the SSH command run in each new pane.
 
-There's no desktop to put a separate window on, so the session takes over the
-*current* terminal instead. The caller is expected to wrap this in
-`App.suspend()` (see app.py) so the dashboard hands off the terminal cleanly
-and resumes when the session ends. Only one session at a time - select a
-host, you're in it; exit it, you're back at the dashboard.
+Every host pane runs *on this box* (see panes.py - it's a tmux pane
+alongside Jumpbox's own, not a window anywhere else), and reaching the
+hosts Jumpbox lists is the reason this box exists, so there's no jump
+needed here: just one direct hop from here to the target.
 
-For now this is a *demo*: each session shows a placeholder banner instead of
-really connecting. Flip ``DEMO_MODE`` to ``False`` (or set ``JUMPBOX_DEMO=0``)
-once SSH keys are ready, and the generated script will run the real ``ssh``
-command instead.
+That single hop is what makes key-based, no-password access work at all.
+OpenSSH itself already tries every available identity automatically -
+keys held by an agent before falling back to a password prompt - so
+there's nothing for Jumpbox to configure for that. What actually has to be
+true:
+
+- **An agent is reachable here.** If you connected to this box from
+  MobaXterm with "Forward SSH agent" / Pageant enabled, `$SSH_AUTH_SOCK`
+  points at that forwarded agent, and ssh will offer whatever keys
+  MobaXterm holds *with no copy of them ever touching this box*. tmux
+  panes inherit this automatically (verified directly) - no extra wiring.
+- **Or this box has its own key the target already trusts** - the normal
+  `~/.ssh/id_*` / `~/.ssh/config` for whichever user is running Jumpbox,
+  same as any other ssh client.
+
+Either way, Jumpbox never sees, stores, or asks for a credential - if
+neither applies for a given host, ssh just falls back to its normal
+password prompt, exactly as if you'd typed the command yourself.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import shlex
-import tempfile
-import uuid
-from pathlib import Path
 
 from .data import Host
 
-# Real SSH by default now that there's a real inventory to connect to. Set
-# JUMPBOX_DEMO=1 to force the placeholder banner back on (e.g. for a demo).
-DEMO_MODE = os.environ.get("JUMPBOX_DEMO", "0") != "0"
 
-_SESSION_DIR = Path(tempfile.gettempdir()) / "jumpbox-sessions"
+def connect_command(host: Host) -> str:
+    """The ssh command a new pane runs to reach `host` directly.
 
-
-def _safe(name: str) -> str:
-    """Make a host name safe to use as a filename."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
-
-
-def _echo(text: str) -> str:
-    """A bash `echo` of literal text - safe regardless of what `text`
-    contains (quotes, `$`, backticks, `;`, ...). Host name/address/username/
-    description all come from a free-text form, and on a shared server one
-    person's host entry runs in *another* person's session, so this can't
-    just trust the content the way a single-user demo could have."""
-    return "echo " + shlex.quote(text)
+    Host fields are free text from the Add Host form, and on a shared
+    server one person's host entry ends up running in another person's
+    pane, so the destination is shell-quoted: it must stay literal text,
+    never extra shell commands, however it was typed into that form."""
+    destination = shlex.quote(host.target)
+    return f"ssh -p {host.port} {destination}"
 
 
-def _posix_script_lines(host: Host) -> list[str]:
-    lines = [
-        "#!/usr/bin/env bash",
-        _echo(""),
-        _echo("  ==========================================================="),
-        _echo(f"    JUMPBOX SESSION   {host.name}"),
-        _echo("  ==========================================================="),
-        _echo(""),
-        _echo(f"    Target : {host.target}"),
-        _echo(f"    Port   : {host.port}"),
-        _echo(f"    OS     : {host.os}"),
-        _echo(f"    Notes  : {host.description}"),
-        _echo(""),
-    ]
-    if DEMO_MODE:
-        lines += [
-            _echo("    [DEMO] SSH is not wired up yet - this is a placeholder."),
-            _echo(f"    [DEMO] Later this runs:  ssh -p {host.port} {host.target}"),
-            _echo(""),
-            _echo("    Type 'exit' to jump back to Jumpbox."),
-            _echo(""),
-        ]
-    else:
-        lines += [
-            _echo(f"    Connecting to {host.target} ..."),
-            _echo(""),
-            f"ssh -p {shlex.quote(str(host.port))} {shlex.quote(host.target)}",
-            _echo(""),
-            _echo("    Session ended. Type 'exit' to jump back to Jumpbox."),
-        ]
-    # `bash script.sh` has no built-in "stay open afterwards" flag - without
-    # this, bash would exit (and the suspended terminal would just drop back
-    # to Jumpbox) the instant the script's last line finishes. exec'ing a
-    # shell as the final line replaces this process with an interactive one
-    # instead, so "type 'exit'" above means something - there's an actual
-    # prompt to exit from.
-    lines.append("exec bash")
-    return lines
-
-
-def _session_script(host: Host) -> Path:
-    """Write a per-host script describing the session, return its path."""
-    _SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    # Unique per launch (not just per host) so connecting to the same host
-    # twice - or many hosts at once - never races two sessions on one file.
-    unique = uuid.uuid4().hex[:8]
-
-    script = _SESSION_DIR / f"session-{_safe(host.name)}-{unique}.sh"
-    script.write_text("\n".join(_posix_script_lines(host)) + "\n", encoding="utf-8")
-    return script
-
-
-def launch_session(host: Host) -> list[str]:
-    """Build the command that opens a session for `host`.
-
-    Nothing is spawned here - the caller runs the returned command itself,
-    inside `App.suspend()`, so it can take over the current terminal.
-    """
-    script = _session_script(host)
-    return ["bash", str(script)]
+def forwarded_agent_available() -> bool:
+    """Whether an SSH agent is actually reachable here - e.g. because
+    MobaXterm forwarded one (Pageant, or a real ssh-agent) when you
+    connected to this box. Checks the socket path itself actually exists,
+    not just that the env var is set, since a stale leftover value
+    pointing at a socket that's gone would otherwise look like a real one."""
+    sock = os.environ.get("SSH_AUTH_SOCK", "")
+    return bool(sock) and os.path.exists(sock)

@@ -1,6 +1,6 @@
 """The Jumpbox Textual application.
 
-A tree-driven SSH jump host, two tabs:
+A tree-driven SSH jump host, three tabs:
 
   Dashboard
     ┌── LOCATIONS ──┐ ┌──────────── HOSTS ────────────┐
@@ -12,6 +12,10 @@ A tree-driven SSH jump host, two tabs:
     │   Room 1      │ │ thin detail strip + [Connect] │
     │   Room 2      │ │                               │
     └───────────────┘ └───────────────────────────────┘
+  Sessions
+    Every host you currently have open, each in its own tmux pane to the
+    right of this one. Read-only - type `exit` in a pane (or let the
+    connection drop) to end it; the row disappears on its own.
   Logs
     A timestamped history of hosts you've jumped to this run, with a
     Reconnect button.
@@ -20,13 +24,14 @@ Pick a location in the tree (click it to expand and reveal its rooms), then
 click a room to list its hosts on the right - each host appears exactly once,
 only in the hosts list, never duplicated in the tree. In the hosts list, a
 single click previews a host's details; a double click (or Enter, or F2, or
-the Connect button) connects - it takes over the current terminal and hands
-control back to the dashboard when the session ends.
+the Connect button) opens it as a new tmux pane - the first one splits off to
+the right of Jumpbox's own pane, every one after that stacks below the last,
+and this dashboard never leaves the screen. See `panes.py` for the mechanism.
 """
 
 from __future__ import annotations
 
-import subprocess
+import os
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -48,8 +53,8 @@ from textual.widgets import (
     Tree,
 )
 
-from . import fuzzy, storage
-from .connect import DEMO_MODE, launch_session
+from . import fuzzy, panes, storage
+from .connect import connect_command, forwarded_agent_available
 from .data import Host, Location, Room, Status
 from .dialogs import (
     ActionMenu,
@@ -58,6 +63,7 @@ from .dialogs import (
     LocationFormDialog,
     RoomFormDialog,
 )
+from .panes import OpenSession
 
 BANNER = r"""
      ██╗██╗   ██╗███╗   ███╗██████╗ ██████╗  ██████╗ ██╗  ██╗
@@ -74,18 +80,32 @@ STATUS_COLOR = {
     Status.OFFLINE: "#ff5555",
 }
 
+# One (bold, full-saturation) colour per location, cycling for any number
+# of them; its rooms use the paired lighter tint of the *same* hue, so a
+# location and its own rooms read as a clear group, and different
+# locations are easy to tell apart at a glance in the tree.
+LOCATION_PALETTE = [
+    ("#ff79c6", "#ffb3e0"),  # pink
+    ("#8be9fd", "#bdf3fe"),  # cyan
+    ("#ffb86c", "#ffd9a8"),  # orange
+    ("#bd93f9", "#dac8fd"),  # purple
+    ("#69d2c1", "#a8e8db"),  # teal
+]
+
 MAX_LOG_ENTRIES = 20
 
 
-def _location_label(location: Location) -> str:
+def _location_label(location: Location, color_index: int) -> str:
+    color = LOCATION_PALETTE[color_index % len(LOCATION_PALETTE)][0]
     return (
-        f"{location.icon} [b]{location.name}[/]  "
+        f"[bold {color}]{location.icon} {location.name}[/]  "
         f"[dim]{location.online}/{location.total_hosts} online[/]"
     )
 
 
-def _room_label(room: Room) -> str:
-    return f"[b]{room.name}[/]  [dim]{room.online}/{len(room.hosts)} online[/]"
+def _room_label(room: Room, color_index: int) -> str:
+    color = LOCATION_PALETTE[color_index % len(LOCATION_PALETTE)][1]
+    return f"[bold {color}]{room.name}[/]  [dim]{room.online}/{len(room.hosts)} online[/]"
 
 
 def _host_label(host: Host) -> str:
@@ -104,6 +124,15 @@ def _log_label(entry: "LogEntry") -> str:
         f"[dim]{stamp}[/]  {entry.location.icon} "
         f"[dim]{entry.location.name} → {entry.room.name} →[/] "
         f"[{color}]{host.name}[/]  [dim]{host.target}[/]"
+    )
+
+
+def _session_label(session: OpenSession) -> str:
+    stamp = session.opened_at.strftime("%I:%M:%S %p")
+    host = session.host
+    color = STATUS_COLOR[host.status]
+    return (
+        f"[dim]{stamp}[/]  [{color}]{host.name}[/]  [dim]{host.target}[/]"
     )
 
 
@@ -161,6 +190,20 @@ class LogItem(ListItem):
         yield Static(_log_label(self.entry))
 
 
+class SessionItem(ListItem):
+    """A row for one open host pane. Read-only by design - the only way to
+    end a session is from inside its own pane (type `exit`, or just let
+    the connection drop); Jumpbox notices either within a second or two
+    and the row disappears on its own."""
+
+    def __init__(self, session: OpenSession) -> None:
+        super().__init__(classes="session-item")
+        self.session = session
+
+    def compose(self) -> ComposeResult:
+        yield Static(_session_label(self.session), classes="session-label")
+
+
 class JumpboxApp(App):
     """Terminal jump host dashboard."""
 
@@ -182,6 +225,13 @@ class JumpboxApp(App):
         self._current_location: Location | None = None
         self._current_room: Room | None = None
         self.logs: list[LogEntry] = []
+        self.open_sessions: list[OpenSession] = []
+        # Set once on_mount confirms this process is actually sitting in a
+        # tmux pane - lets __main__.py kill the whole session on exit, and
+        # lets _connect() refuse to open a pane it has nowhere to put.
+        self.tmux_session: str | None = None
+        self._jumpbox_pane_id = ""
+        self._window_id = ""
         # Lets us clear the host search box without re-triggering a search.
         self._suppress_host_search = False
 
@@ -193,8 +243,7 @@ class JumpboxApp(App):
         with Vertical(id="banner-wrap"):
             yield Static(BANNER, id="banner")
             yield Static(
-                "Secure SSH jump host  ·  Micron Technologies"
-                + ("   [#f1fa8c]· DEMO MODE ·[/]" if DEMO_MODE else ""),
+                "Secure SSH jump host  ·  Micron Technologies",
                 id="subtitle",
             )
         with TabbedContent(id="tabs"):
@@ -206,7 +255,7 @@ class JumpboxApp(App):
                                 placeholder="Search locations…", id="location-search"
                             )
                             yield Button(
-                                "⋮", id="location-menu-btn", classes="kebab-btn"
+                                "+", id="location-menu-btn", classes="add-btn"
                             )
                         yield Tree("Locations", id="locations")
                     with Vertical(id="hosts-pane"):
@@ -215,7 +264,7 @@ class JumpboxApp(App):
                                 placeholder="Search hosts…", id="host-search"
                             )
                             yield Button(
-                                "⋮", id="host-menu-btn", classes="kebab-btn"
+                                "+", id="host-menu-btn", classes="add-btn"
                             )
                         yield ListView(id="hosts")
                         with Vertical(id="detail"):
@@ -225,6 +274,14 @@ class JumpboxApp(App):
                                     "▶ Connect", id="connect", variant="success"
                                 )
                                 yield Button("⟳ Refresh", id="refresh")
+            with TabPane("🖥 Sessions", id="sessions"):
+                with Vertical(id="sessions-pane"):
+                    yield Static(
+                        "Hosts you have open right now, each in its own pane "
+                        "to the right of this one. Type exit in a pane to end it.",
+                        id="sessions-caption",
+                    )
+                    yield ListView(id="session-list")
             with TabPane("🕓 Logs", id="logs"):
                 with Vertical(id="logs-pane"):
                     yield Static(
@@ -241,14 +298,50 @@ class JumpboxApp(App):
         self.query_one("#locations-pane").border_title = "LOCATIONS"
         self.query_one("#hosts-pane").border_title = "HOSTS"
         self.query_one("#detail").border_title = "DETAIL"
+        self.query_one("#sessions-pane").border_title = "SESSIONS"
 
         tree = self.query_one("#locations", Tree)
         tree.show_root = False
         tree.guide_depth = 3
 
+        if "TMUX" in os.environ:
+            try:
+                self._jumpbox_pane_id = panes.current_pane_id()
+                self._window_id = panes.current_window_id()
+                self.tmux_session = panes.current_session_name()
+                panes.enable_mouse(self.tmux_session)
+            except RuntimeError as exc:
+                self.notify(f"tmux session detection failed: {exc}", severity="error")
+        else:
+            self.notify(
+                "Not running inside tmux - connecting has nowhere to open a pane.",
+                title="Jumpbox",
+                severity="warning",
+            )
+
+        if forwarded_agent_available():
+            self.notify(
+                "SSH agent detected - host connections will try your "
+                "forwarded keys before any password.",
+                title="Jumpbox",
+            )
+        else:
+            self.notify(
+                "No forwarded SSH agent detected ($SSH_AUTH_SOCK) - host "
+                "connections will prompt for a password unless this box has "
+                "its own key for that host. Enable 'Forward SSH agent' "
+                "(Pageant) in MobaXterm's session settings to use your "
+                "local keys instead.",
+                title="Jumpbox",
+                severity="warning",
+                timeout=10,
+            )
+
         self.locations = storage.load()
         await self._populate_locations()
+        await self._populate_sessions()
         await self._populate_logs()
+        self.set_interval(1.0, self._reconcile_sessions)
 
     # --------------------------------------------------------------- populate
     async def _populate_locations(self, query: str = "") -> None:
@@ -264,11 +357,17 @@ class JumpboxApp(App):
         first_room_node = None
         current_room_node = None
         for location in locations:
+            # Indexed against the *full* inventory, not this (possibly
+            # filtered) list, so a location's colour stays put regardless
+            # of what a search happens to be narrowing the tree down to.
+            color_index = self.locations.index(location)
             location_node = tree.root.add(
-                _location_label(location), data=location, expand=True
+                _location_label(location, color_index), data=location, expand=True
             )
             for room in location.rooms:
-                room_node = location_node.add_leaf(_room_label(room), data=room)
+                room_node = location_node.add_leaf(
+                    _room_label(room, color_index), data=room
+                )
                 if first_room_node is None:
                     first_room_node, first_location, first_room = (
                         room_node,
@@ -323,6 +422,18 @@ class JumpboxApp(App):
             )
             return
         await view.extend(LogItem(entry) for entry in self.logs)
+
+    async def _populate_sessions(self) -> None:
+        view = self.query_one("#session-list", ListView)
+        await view.clear()
+        if not self.open_sessions:
+            await view.append(
+                ListItem(
+                    Static("[dim]No open sessions — connect to a host to open one.[/]")
+                )
+            )
+            return
+        await view.extend(SessionItem(session) for session in self.open_sessions)
 
     async def _select_room(self, location: Location, room: Room) -> None:
         if room is self._current_room:
@@ -413,10 +524,10 @@ class JumpboxApp(App):
     @work
     async def _on_location_menu_button(self) -> None:
         node = self.query_one("#locations", Tree).cursor_node
-        options = [("add-location", "➕ Add Location")]
+        options = [("add-location", "Add Location")]
         if node is not None:
-            options.append(("add-room", "➕ Add Room"))
-            options.append(("delete", "🗑 Delete Selected"))
+            options.append(("add-room", "Add Room"))
+            options.append(("delete", "Delete Selected"))
         choice = await self.push_screen_wait(ActionMenu("Locations", options))
         if choice == "add-location":
             await self._add_location()
@@ -428,9 +539,9 @@ class JumpboxApp(App):
     @on(Button.Pressed, "#host-menu-btn")
     @work
     async def _on_host_menu_button(self) -> None:
-        options = [("add-host", "➕ Add Host")]
+        options = [("add-host", "Add Host")]
         if self._highlighted_host() is not None:
-            options.append(("delete", "🗑 Delete Selected"))
+            options.append(("delete", "Delete Selected"))
         choice = await self.push_screen_wait(ActionMenu("Hosts", options))
         if choice == "add-host":
             await self._add_host()
@@ -458,6 +569,8 @@ class JumpboxApp(App):
     async def _on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.pane.id == "logs":
             await self._populate_logs()
+        elif event.pane.id == "sessions":
+            await self._populate_sessions()
 
     @on(Button.Pressed, "#quit-btn")
     async def _on_quit_button(self) -> None:
@@ -604,27 +717,53 @@ class JumpboxApp(App):
         room = room or self._current_room
         if host.status is Status.OFFLINE:
             self.notify(
-                f"{host.name} is OFFLINE — opening a window anyway (demo).",
+                f"{host.name} is OFFLINE — opening a pane anyway.",
                 title="Heads up",
                 severity="warning",
             )
 
-        # No separate window is possible here - hand the whole terminal to
-        # the session and resume the dashboard once it ends.
-        args = launch_session(host)
-        self._run_foreground(args)
-        self.notify(f"Welcome back from {host.name}.", title="Jumpbox")
+        if self.tmux_session is None:
+            self.notify(
+                "No tmux session detected, so there's nowhere to open a new pane.",
+                title="Jumpbox",
+                severity="error",
+            )
+            return
+
+        # The first host splits off Jumpbox's own pane, to the right; every
+        # host after that splits off the previously opened host pane,
+        # below it - so the right-hand column just grows downward.
+        if self.open_sessions:
+            target_pane = self.open_sessions[-1].pane_id
+            stacked = True
+        else:
+            target_pane = self._jumpbox_pane_id
+            stacked = False
+
+        try:
+            new_pane_id = panes.open_pane(target_pane, connect_command(host), stacked=stacked)
+        except RuntimeError as exc:
+            self.notify(f"Couldn't open a pane for {host.name}: {exc}", severity="error")
+            return
+
+        self.open_sessions.append(OpenSession(new_pane_id, host, datetime.now()))
+        self.run_worker(self._populate_sessions())
+        self.notify(f"Opened {host.name} in a new pane.", title="Jumpbox")
 
         if location is not None and room is not None:
             self.logs.insert(0, LogEntry(datetime.now(), location, room, host))
             del self.logs[MAX_LOG_ENTRIES:]
 
-    def _run_foreground(self, args: list[str]) -> None:
-        """Suspend the dashboard and hand the terminal to `args` (e.g. plain
-        ssh) - there's no separate window to open it in instead."""
-        with self.suspend():
-            subprocess.run(args)
-
-
-def run() -> None:
-    JumpboxApp().run()
+    async def _reconcile_sessions(self) -> None:
+        """The only way a session ends is from inside its own pane - typing
+        `exit`, or the connection just dropping - so this is the only thing
+        that ever removes a row from the Sessions tab: poll which panes
+        tmux still actually has, and drop whichever tracked ones aren't in
+        that set any more."""
+        if self.tmux_session is None or not self.open_sessions:
+            return
+        alive = panes.live_pane_ids(self._window_id)
+        if all(session.pane_id in alive for session in self.open_sessions):
+            return
+        self.open_sessions = [s for s in self.open_sessions if s.pane_id in alive]
+        await self._populate_sessions()

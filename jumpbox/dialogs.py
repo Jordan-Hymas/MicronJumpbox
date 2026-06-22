@@ -1,6 +1,6 @@
 """Modal dialogs for adding/removing locations, rooms, and hosts.
 
-Each "⋮" button in the dashboard opens an ActionMenu, which routes to either
+Each "+" button in the dashboard opens an ActionMenu, which routes to either
 a confirmation dialog (for deletes) or a small add-form. All of them are
 pushed with `push_screen_wait` and resolve to a plain value (or None if the
 user cancelled), so the caller in app.py just awaits a result.
@@ -19,7 +19,7 @@ from .data import Host, Location, Room, Status
 
 
 class ActionMenu(ModalScreen[str | None]):
-    """A tiny menu of (action_id, label) choices, opened from a "⋮" button."""
+    """A tiny menu of (action_id, label) choices, opened from a "+" button."""
 
     BINDINGS = [Binding("escape", "dismiss_menu", "Cancel", show=False)]
 
@@ -29,11 +29,18 @@ class ActionMenu(ModalScreen[str | None]):
         self._options = options
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog-box", id="menu-box"):
+        with Vertical(classes="dialog-box menu-card", id="menu-box"):
             yield Static(self._title, classes="dialog-title")
             for action_id, label in self._options:
-                yield Button(label, id=f"opt-{action_id}", classes="menu-option")
-            yield Button("Cancel", id="opt-cancel", classes="menu-option")
+                variant = (
+                    "success"
+                    if action_id.startswith("add-")
+                    else "error" if action_id == "delete" else "default"
+                )
+                yield Button(
+                    label, id=f"opt-{action_id}", classes="menu-option", variant=variant
+                )
+            yield Button("Cancel", id="opt-cancel", classes="menu-option menu-cancel")
 
     def action_dismiss_menu(self) -> None:
         self.dismiss(None)
@@ -150,18 +157,28 @@ class HostFormDialog(_FormDialog):
         self._room_name = room_name
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog-box", id="form-box"):
+        with Vertical(classes="dialog-box wide", id="form-box"):
             yield Static(f"Add Host to {self._room_name}", classes="dialog-title")
+
             yield Static("Name", classes="field-label")
             yield Input(placeholder="e.g. db-app-03", id="f-name")
-            yield Static("Address", classes="field-label")
-            yield Input(placeholder="e.g. 10.20.0.20", id="f-address")
-            yield Static("Username", classes="field-label")
-            yield Input(placeholder="e.g. operator", id="f-username")
-            yield Static("Port", classes="field-label")
-            yield Input(placeholder="22", id="f-port")
-            yield Static("OS", classes="field-label")
-            yield Input(placeholder="e.g. Ubuntu 22.04", id="f-os")
+
+            with Horizontal(classes="field-row"):
+                with Vertical(classes="field-group left"):
+                    yield Static("Address", classes="field-label")
+                    yield Input(placeholder="e.g. 10.20.0.20", id="f-address")
+                with Vertical(classes="field-group"):
+                    yield Static("Port", classes="field-label")
+                    yield Input(placeholder="22", id="f-port")
+
+            with Horizontal(classes="field-row"):
+                with Vertical(classes="field-group left"):
+                    yield Static("Username", classes="field-label")
+                    yield Input(placeholder="e.g. operator", id="f-username")
+                with Vertical(classes="field-group"):
+                    yield Static("OS", classes="field-label")
+                    yield Input(placeholder="e.g. Ubuntu 22.04", id="f-os")
+
             yield Static("Description", classes="field-label")
             yield Input(placeholder="optional", id="f-description")
             yield Static("", id="form-error")

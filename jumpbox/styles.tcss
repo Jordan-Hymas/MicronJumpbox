@@ -1,7 +1,17 @@
 /* Jumpbox dashboard styling */
 
+/* The brand colour - every border, panel title, and the banner below are
+   built on $accent/$primary, so overriding them here is the one place to
+   change Jumpbox's whole look. */
+$accent: #b014e5;
+$primary: #b014e5;
+
 Screen {
     background: $background;
+}
+
+HeaderTitle {
+    color: $accent;
 }
 
 /* Textual's own Button default is min-width: 16, which pads every button
@@ -9,6 +19,15 @@ Screen {
    the smallest possible size, with guaranteed-even centering. */
 Button {
     min-width: 0;
+}
+
+/* Textual's default focus indicator reverses the video of the button's
+   own text run, which paints a mismatched box behind the label instead
+   of blending into the button's fill - most visible on coloured variants
+   in terminals with limited true-color support (e.g. MobaXterm). Bold is
+   a clear enough focus cue on its own and renders correctly everywhere. */
+Button:focus {
+    text-style: bold;
 }
 
 /* ---- top bar --------------------------------------------------------- */
@@ -19,22 +38,28 @@ Button {
 }
 
 /* ---- banner -------------------------------------------------------- */
+/* `align-horizontal: center` on the wrapper only centres the *group* of
+   children as a block - sized to the widest one (the banner) - so the
+   shorter subtitle ended up sharing the banner's left edge instead of
+   being centred on its own. Giving each one the full row width and
+   centring its own text fixes that at any terminal size. */
 #banner-wrap {
     height: auto;
-    align-horizontal: center;
     padding-top: 0;
 }
 
 #banner {
-    width: auto;
+    width: 1fr;
     color: $accent;
     text-style: bold;
+    text-align: center;
 }
 
 #subtitle {
-    width: auto;
+    width: 1fr;
     color: $text-muted;
     text-style: italic;
+    text-align: center;
     padding: 0;
 }
 
@@ -85,6 +110,22 @@ Tree {
     background: transparent;
 }
 
+/* The selected-row highlight: a low-opacity white wash works over any
+   text colour - including the per-location palette above - or theme,
+   instead of the default accent-tinted cursor colour, which would clash
+   with some of those hues. */
+#locations > .tree--cursor {
+    background: white 16%;
+}
+
+#locations:focus > .tree--cursor {
+    background: white 24%;
+}
+
+#locations > .tree--highlight-line {
+    background: white 8%;
+}
+
 Input {
     margin-bottom: 1;
     border: tall $primary 60%;
@@ -101,8 +142,18 @@ Input:focus {
     width: 1fr;
 }
 
-.kebab-btn {
+.add-btn {
     margin-left: 1;
+    min-width: 5;
+    color: $accent;
+    text-style: bold;
+    border: round $accent 50%;
+    background: $panel;
+}
+.add-btn:hover {
+    color: $text;
+    background: $accent 25%;
+    border: round $accent;
 }
 
 .host-item {
@@ -123,7 +174,7 @@ ListView:focus > ListItem.-highlight {
    above keep most of the vertical space. */
 #detail {
     height: auto;
-    min-height: 3;
+    min-height: 4;
     border-top: solid $primary 35%;
     border-title-color: $text-muted;
     border-title-align: left;
@@ -144,6 +195,38 @@ ListView:focus > ListItem.-highlight {
 
 #actions Button {
     margin-left: 1;
+}
+
+/* ---- sessions tab ----------------------------------------------------- */
+#sessions-pane {
+    height: 1fr;
+    padding: 1 2;
+}
+
+#sessions-caption {
+    height: auto;
+    color: $text-muted;
+    padding-bottom: 1;
+}
+
+#session-list {
+    height: 1fr;
+    background: transparent;
+    border: round $primary;
+    padding: 1;
+    overflow-y: auto;
+}
+
+.session-item {
+    height: auto;
+    padding: 0;
+    margin-bottom: 1;
+}
+
+.session-label {
+    width: 1fr;
+    height: auto;
+    content-align: left middle;
 }
 
 /* ---- logs tab ------------------------------------------------------- */
@@ -178,22 +261,38 @@ ListView:focus > ListItem.-highlight {
     margin-top: 1;
 }
 
-/* ---- modal dialogs (menus, confirm, add-forms) ----------------------- */
+/* ---- modal dialogs (menus, confirm, add-forms) -----------------------
+   Each is a single floating card: a title with its own underline acting
+   as a header divider, the body content, then a footer divider above
+   the action buttons - so even the tallest form reads as a compact
+   popup, not a full replacement screen. */
 ModalScreen {
     align: center middle;
+    background: $background 75%;
 }
 
 .dialog-box {
-    width: 42;
+    width: 50;
     height: auto;
+    max-height: 90%;
     background: $panel;
+    tint: $accent 6%;
     border: round $accent;
     padding: 1 2;
 }
 
+.dialog-box.wide {
+    width: 76;
+}
+
 .dialog-title {
     text-style: bold;
+    color: $accent;
+    text-align: center;
+    height: auto;
     padding-bottom: 1;
+    margin-bottom: 1;
+    border-bottom: solid $accent 40%;
 }
 
 .field-label {
@@ -205,6 +304,19 @@ ModalScreen {
     margin-bottom: 1;
 }
 
+.field-row {
+    height: auto;
+}
+
+.field-group {
+    width: 1fr;
+    height: auto;
+}
+
+.field-group.left {
+    margin-right: 2;
+}
+
 #form-error {
     height: 1;
     margin-bottom: 1;
@@ -213,16 +325,26 @@ ModalScreen {
 .dialog-actions {
     height: auto;
     align-horizontal: right;
+    padding-top: 1;
+    margin-top: 1;
+    border-top: solid $primary 25%;
 }
 
 .dialog-actions Button {
     margin-left: 1;
+    min-width: 10;
 }
 
-#menu-box {
-    align-horizontal: center;
+/* ---- action menu (the "+" popup) -------------------------------------- */
+.menu-card {
+    width: 40;
 }
 
 .menu-option {
+    width: 100%;
     margin-bottom: 1;
+}
+
+.menu-cancel {
+    color: $text-muted;
 }

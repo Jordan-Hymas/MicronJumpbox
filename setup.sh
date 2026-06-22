@@ -10,6 +10,11 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux not found - Jumpbox needs it to open host connections in their own panes (e.g. sudo apt install tmux)" >&2
+    exit 1
+fi
+
 if [ ! -d .venv ]; then
     echo "Creating virtual environment in .venv ..."
     python3 -m venv .venv

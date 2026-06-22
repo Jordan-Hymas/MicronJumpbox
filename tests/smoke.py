@@ -3,20 +3,26 @@
 Runs the real Textual app with no visible terminal (via run_test) and exercises
 the core flow: theme, the locations -> rooms tree (with no duplicated host
 leaves), fuzzy search, room switching, single-click-preview vs
-double-click-connect on hosts, the timestamped Logs tab, and that the demo
-session-launch path generates a unique script per call (so multiple launches
-never collide).
+double-click-connect on hosts, opening hosts as tmux panes (a real tmux is
+never required - `panes.open_pane`/`live_pane_ids` are monkeypatched so this
+runs anywhere), that a session only ever ends from inside its own pane (no
+Close button - reconciliation is what notices and prunes it), that two
+logins (even two people sharing one OS account) always get distinct tmux
+session names, that connect_command() is a single direct hop with no
+needless jump, that forwarded-SSH-agent detection reflects a real socket
+and not just a leftover env var, the timestamped Logs tab, and that the
+ssh command run in each pane can't be hijacked by malicious host fields.
 
-`launch_session` is monkeypatched while driving the app through the pilot so
-this test never actually pops a real terminal window. JUMPBOX_DATA_DIR is
-pointed at a throwaway temp folder before anything imports jumpbox, so this
-test never reads or writes a real user's saved inventory.
+JUMPBOX_DATA_DIR is pointed at a throwaway temp folder before anything
+imports jumpbox, so this test never reads or writes a real user's saved
+inventory.
 
 Run from the project root:  python -m tests.smoke
 """
 
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,41 +35,14 @@ os.environ["JUMPBOX_DATA_DIR"] = _TEST_DATA_DIR
 from textual.widgets import Button, Input, TabbedContent, Tree
 
 import jumpbox.app as appmod
-import jumpbox.connect as connect
 from jumpbox import storage
-from jumpbox.app import HostItem, JumpboxApp, LogItem
-from jumpbox.connect import launch_session
+from jumpbox.app import HostItem, JumpboxApp, LogItem, SessionItem
+from jumpbox.connect import connect_command
 from jumpbox.data import Host, Location, Room, Status, load_inventory
 
 
 def _count(app, kind) -> int:
     return len(app.query(kind))
-
-
-def _check_script_stays_open(script_path: str) -> None:
-    """`bash script.sh` has no built-in "stay open afterwards" flag - without
-    an exec'd shell as the script's last line, bash exits the instant it's
-    done and the suspended terminal just drops back to Jumpbox with no
-    usable session ever having been visible."""
-    content = Path(script_path).read_text(encoding="utf-8")
-    last_line = content.strip().splitlines()[-1]
-    assert last_line.startswith("exec "), (
-        f"script must end by exec'ing a shell so the window doesn't "
-        f"immediately close once it finishes, got: {last_line!r}"
-    )
-
-
-def _check_bash_syntax(script_path: str) -> None:
-    """`bash -n` parses without running - a real syntax check for the
-    generated POSIX scripts, even though this machine can't execute them."""
-    import shutil
-    import subprocess
-
-    bash = shutil.which("bash")
-    if bash is None:
-        return  # no bash available to check with (e.g. a bare CI image)
-    result = subprocess.run([bash, "-n", script_path], capture_output=True, text=True)
-    assert result.returncode == 0, f"invalid bash syntax in {script_path}: {result.stderr}"
 
 
 async def _wait_until(pilot, predicate, attempts: int = 20) -> None:
@@ -77,16 +56,31 @@ async def _wait_until(pilot, predicate, attempts: int = 20) -> None:
 
 
 async def main() -> None:
-    launched: list[Host] = []
-    appmod.launch_session = lambda host: launched.append(host)
+    # No real tmux involved in this run - fake the one call that would
+    # otherwise shell out, and record what it was asked to do. Backed by
+    # the same `live_panes` set live_pane_ids() reports from, so the *real*
+    # background reconciliation timer (it keeps running throughout this
+    # whole test, same as in the real app) never touches actual tmux.
+    opened: list[tuple[str, str, bool]] = []
+    live_panes: set[str] = set()
+
+    def fake_open_pane(target_pane: str, command: str, *, stacked: bool) -> str:
+        pane_id = f"%{len(opened) + 1}"
+        opened.append((target_pane, command, stacked))
+        live_panes.add(pane_id)
+        return pane_id
+
+    appmod.panes.open_pane = fake_open_pane
+    appmod.panes.live_pane_ids = lambda window_id: set(live_panes)
 
     app = JumpboxApp()
-    # The headless driver behind run_test() can't suspend a real terminal,
-    # so stub out the hand-off itself - same reason launch_session is
-    # stubbed above, just one step further down the same call path.
-    app._run_foreground = lambda args: None
     async with app.run_test(size=(120, 45)) as pilot:
         await pilot.pause()
+
+        assert app.tmux_session is None, (
+            "this headless run has no real $TMUX - Jumpbox must detect that "
+            "rather than assume a session exists"
+        )
 
         assert app.theme == "dracula", f"expected dracula theme, got {app.theme}"
 
@@ -126,26 +120,86 @@ async def main() -> None:
         assert _count(app, HostItem) == 2, "second room (Datacenter 2) should have 2 hosts"
         assert app.query_one("#host-search").value == "", "search resets per room"
 
-        # --- single click previews, double click connects ----------------
+        # --- single click previews; double click needs a tmux session ----
         host_items = list(app.query(HostItem))
         target = host_items[1]
         target_host = target.host
         assert app._highlighted_host() is not target_host, "test needs a non-default target"
+        expected_command = connect_command(target_host)
+        assert expected_command == (
+            f"ssh -p 22 {shlex.quote(target_host.target)}"
+        ), f"unexpected connect command: {expected_command!r}"
 
         await pilot.click(target)
         await pilot.pause()
         assert app._highlighted_host() is target_host, "single click should move the preview"
         assert target_host.name in str(app.query_one("#detail-body").render())
-        assert not launched, "single click must not launch a session"
         assert not app.logs, "single click must not add a log entry"
+
+        # With no real tmux session (the real state in this headless run),
+        # double click must refuse - never silently no-op, never crash.
+        await pilot.click(target, times=2)
+        await pilot.pause()
+        assert not opened, "no tmux session means there's nowhere to open a pane"
+        assert not app.logs, "a refused connect must not be logged"
+
+        # Fake having a real tmux session, the same way on_mount would set
+        # it up after a successful real detection.
+        app.tmux_session = "fake-session"
+        app._jumpbox_pane_id = "%0"
+        app._window_id = "@0"
 
         await pilot.click(target, times=2)
         await pilot.pause()
-        assert len(launched) == 1, f"double click should connect exactly once, got {len(launched)}"
-        assert launched[0] is target_host
-        assert len(app.logs) == 1, "double click should add a log entry"
+        assert len(opened) == 1, f"double click should open exactly one pane, got {len(opened)}"
+        first_target, first_command, first_stacked = opened[0]
+        assert first_target == "%0", "the first host pane must split off Jumpbox's own pane"
+        assert first_stacked is False, "the first host pane must split sideways, not stacked"
+        assert first_command == expected_command
+        assert len(app.open_sessions) == 1
+        assert app.open_sessions[0].host is target_host
+        assert app.open_sessions[0].pane_id == "%1"
+        assert len(app.logs) == 1, "a successful connect should add a log entry"
+        assert app.logs[0].host is target_host
 
-        # Logs tab should reflect the log once activated, with a full timestamp.
+        # A second host must stack *below the first host pane*, not split
+        # off Jumpbox's pane again.
+        other_target = host_items[0]
+        other_host = other_target.host
+        await pilot.click(other_target, times=2)
+        await pilot.pause()
+        assert len(opened) == 2
+        second_target, _, second_stacked = opened[1]
+        assert second_target == "%1", "the second host pane must split off the first host pane"
+        assert second_stacked is True, "every host after the first must stack below the last"
+        assert len(app.open_sessions) == 2
+
+        # --- Sessions tab lists every open host, read-only ---------------
+        app.query_one(TabbedContent).active = "sessions"
+        await pilot.pause()
+        session_items = list(app.query(SessionItem))
+        assert len(session_items) == 2, f"expected 2 open sessions, got {len(session_items)}"
+
+        # There's no Close button - a session only ever ends from inside
+        # its own pane (typed `exit`, or the connection just dropping),
+        # simulated here by tmux simply no longer reporting that one pane.
+        first_pane_id = app.open_sessions[0].pane_id
+        live_panes.discard(first_pane_id)
+        await app._reconcile_sessions()
+        await pilot.pause()
+        assert len(app.open_sessions) == 1, "ending one session must not touch the other"
+        assert app.open_sessions[0].host is other_host
+        assert len(list(app.query(SessionItem))) == 1
+
+        # And once every remaining pane is gone too, the list empties out.
+        live_panes.clear()
+        await app._reconcile_sessions()
+        await pilot.pause()
+        assert not app.open_sessions, "reconciliation must drop panes tmux no longer has"
+        assert not list(app.query(SessionItem))
+
+        # Logs tab should still carry the full history with real timestamps.
+        assert len(app.logs) == 2, "both connects should have been logged"
         app.query_one(TabbedContent).active = "logs"
         await pilot.pause()
         log_items = list(app.query(LogItem))
@@ -236,29 +290,95 @@ async def main() -> None:
             "dismissing the menu should return cleanly to the dashboard"
         )
 
-    # Two launches (even for the same host) must never collide on one file -
-    # this is what lets connecting to the same host twice race-free.
+    # --- on_mount's real tmux-detection branch: a separate app instance,
+    # since the rest of this test deliberately runs with no real $TMUX ----
+    os.environ["TMUX"] = "/tmp/fake-tmux-socket,0,0"
+    appmod.panes.current_pane_id = lambda: "%9"
+    appmod.panes.current_window_id = lambda: "@9"
+    appmod.panes.current_session_name = lambda: "detected-session"
+    mouse_enabled_for: list[str] = []
+    appmod.panes.enable_mouse = lambda session: mouse_enabled_for.append(session)
+    try:
+        detect_app = JumpboxApp()
+        async with detect_app.run_test(size=(120, 45)) as detect_pilot:
+            await detect_pilot.pause()
+            assert detect_app.tmux_session == "detected-session", (
+                "on_mount must pick up the real session name when $TMUX is set"
+            )
+            assert detect_app._jumpbox_pane_id == "%9"
+            assert detect_app._window_id == "@9"
+            assert mouse_enabled_for == ["detected-session"], (
+                "on_mount must turn mouse mode on so clicking any pane focuses "
+                "it, instead of leaving the terminal's own mouse handling in the way"
+            )
+    finally:
+        del os.environ["TMUX"]
+
+    # connect_command() is a single direct hop - every pane already runs on
+    # this box, which is the only reason any of these hosts are reachable
+    # at all, so there's nothing to jump through.
     host = load_inventory()[0].rooms[0].hosts[0]
-    args_a = launch_session(host)
-    args_b = launch_session(host)
-    assert args_a[-1] != args_b[-1], "each launch must get its own script file"
-    assert args_a[0] == "bash", f"unexpected launch args: {args_a}"
+    direct_command = connect_command(host)
+    assert direct_command == f"ssh -p {host.port} {shlex.quote(host.target)}", (
+        f"unexpected connect command: {direct_command!r}"
+    )
+    assert "-J" not in direct_command, (
+        "no jump is needed - the pane running this command is already on "
+        "the box that can reach the target"
+    )
 
-    # `bash -n` (a real syntax check, no execution) catches quoting bugs in
-    # the generated script, and _check_script_stays_open guards the "flashes
-    # and immediately closes" bug from coming back.
-    _check_bash_syntax(args_a[1])
-    _check_script_stays_open(args_a[1])
+    # forwarded_agent_available() must reflect a *real* socket, not just
+    # that the env var happens to be set to something.
+    from jumpbox.connect import forwarded_agent_available
 
-    # Host fields are free text from the Add Host form, and on a shared
-    # server one person's entry runs in *another* person's session - so
-    # shell metacharacters in them must never execute. DEMO_MODE off so
-    # the target string actually reaches the ssh command line, not just
-    # the echo banner. A fake `ssh` shadows the real one via PATH so this
-    # makes zero network calls regardless of what the malicious address
-    # resolves to.
-    real_demo_mode = connect.DEMO_MODE
-    connect.DEMO_MODE = False
+    real_sock = tempfile.mkstemp(prefix="jumpbox-fake-agent-")[1]
+    try:
+        os.environ["SSH_AUTH_SOCK"] = real_sock
+        assert forwarded_agent_available(), "an existing socket path should count"
+        os.environ["SSH_AUTH_SOCK"] = "/no/such/socket/path"
+        assert not forwarded_agent_available(), (
+            "a stale path that doesn't exist must not look like a real agent"
+        )
+        del os.environ["SSH_AUTH_SOCK"]
+        assert not forwarded_agent_available(), "no env var at all means no agent"
+    finally:
+        os.environ.pop("SSH_AUTH_SOCK", None)
+        Path(real_sock).unlink(missing_ok=True)
+
+    # Two logins must never collide on one tmux session - including two
+    # people sharing one OS account, which only differ by pty.
+    import jumpbox.panes as panes_module
+
+    os.environ["USER"] = "alice"
+    os.environ["SSH_TTY"] = "/dev/pts/3"
+    alice_pts3_a = panes_module.session_name()
+    alice_pts3_b = panes_module.session_name()
+    assert alice_pts3_a == alice_pts3_b, (
+        "the same login (same user, same pty) must keep targeting the same "
+        "session across calls, so relaunching restarts *its own* session"
+    )
+
+    os.environ["SSH_TTY"] = "/dev/pts/7"
+    alice_pts7 = panes_module.session_name()
+    assert alice_pts7 != alice_pts3_a, (
+        "the same shared OS account on a different pty (a second person, on "
+        "a shared bastion login) must get a different session"
+    )
+
+    os.environ["USER"] = "bob"
+    bob_pts7 = panes_module.session_name()
+    assert bob_pts7 != alice_pts7, "a different user must get a different session"
+
+    del os.environ["SSH_TTY"]
+    no_tty_name = panes_module.session_name()
+    assert no_tty_name, "missing $SSH_TTY must still fall back to *something*, not crash"
+
+    # Host fields are free text from the Add Host form, and connect_command()'s
+    # output is run *directly* as a real tmux pane's shell command - so on a
+    # shared server, one person's malicious host entry must never be able to
+    # inject extra shell commands into another person's opened pane. A fake
+    # `ssh` shadows the real one via PATH so this makes zero network calls
+    # regardless of what the malicious address resolves to.
     work_dir = Path(tempfile.mkdtemp(prefix="jumpbox-injection-check-"))
     marker_name = "pwned_marker"
     try:
@@ -274,13 +394,11 @@ async def main() -> None:
             description=f"`touch {marker_name}`",
             status=Status.ONLINE,
         )
-        evil_args = launch_session(evil)
-        _check_bash_syntax(evil_args[1])
+        evil_command = connect_command(evil)
 
         env = {**os.environ, "PATH": f"{work_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
         subprocess.run(
-            ["bash", evil_args[1]],
-            input="exit\n",
+            ["bash", "-c", evil_command],
             capture_output=True,
             text=True,
             env=env,
@@ -291,7 +409,6 @@ async def main() -> None:
             "malicious host fields executed as shell commands instead of staying literal text"
         )
     finally:
-        connect.DEMO_MODE = real_demo_mode
         shutil.rmtree(work_dir, ignore_errors=True)
 
     # A corrupted inventory file must never crash the app or be silently
@@ -305,9 +422,12 @@ async def main() -> None:
 
     print(
         "SMOKE OK — theme, locations/rooms tree (no dup hosts), fuzzy search, "
-        "room switch, single/double click, logs with timestamps, quit button, "
-        "add/delete with confirmation, persistence across restarts, corrupt-file "
-        "recovery, foreground launch, unique launches all good."
+        "room switch, no-tmux refusal, pane-opening/stacking, exit-only pane "
+        "reconciliation, mouse-mode detection, per-login session isolation, "
+        "direct (no-jump) connect commands, forwarded-agent detection, logs "
+        "with timestamps, quit button, add/delete with confirmation, "
+        "persistence across restarts, corrupt-file recovery, and "
+        "connect-command injection safety all good."
     )
 
 
