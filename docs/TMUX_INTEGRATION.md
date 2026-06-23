@@ -202,7 +202,7 @@ at `left=80 top=25 width=120 height=25` directly below it.
 
 `-P -F '#{pane_id}'` makes `split-window` print the new pane's id (e.g.
 `%16`) instead of nothing, which is how `open_pane()` returns a value at
-all - that id is what `app.py` stores in an `OpenSession` to track it.
+all - that id is what `app.py` stores in an `ActivityEntry` to track it.
 
 ### Closing a pane
 
@@ -219,25 +219,33 @@ and why it was removed) - now a pane closing *is* the close action.
 ### Noticing a pane is gone: reconciliation
 
 Since there's no button telling Jumpbox "this one's done," it has to
-notice on its own. `app.py`'s `_reconcile_sessions()` runs every second
+notice on its own. `app.py`'s `_reconcile_activity()` runs every second
 (`self.set_interval(1.0, ...)`):
 
 ```python
-async def _reconcile_sessions(self) -> None:
-    if self.tmux_session is None or not self.open_sessions:
+async def _reconcile_activity(self) -> None:
+    open_entries = [entry for entry in self.activity if entry.is_open]
+    if self.tmux_session is None or not open_entries:
         return
     alive = panes.live_pane_ids(self._window_id)
-    if all(session.pane_id in alive for session in self.open_sessions):
+    if all(entry.pane_id in alive for entry in open_entries):
         return
-    self.open_sessions = [s for s in self.open_sessions if s.pane_id in alive]
-    await self._populate_sessions()
+    now = datetime.now()
+    for entry in open_entries:
+        if entry.pane_id not in alive:
+            entry.closed_at = now
+    self._trim_activity()
+    await self._populate_activity()
 ```
 
 `live_pane_ids()` is just `tmux list-panes -t <window_id>` parsed into a
-set of ids. Any tracked `OpenSession` whose pane id isn't in that set any
-more gets dropped, and the Sessions tab list is rebuilt. This also catches
-a pane closed some way Jumpbox didn't initiate at all - e.g. tmux's own
-pane-close key, if someone's personal tmux config binds one.
+set of ids. Any open `ActivityEntry` whose pane id isn't in that set any
+more gets `closed_at` set - it's marked closed (shows as plain history
+instead of "● OPEN" on the Activity tab) rather than removed outright, so
+the tab keeps a record of every connection made this run, not just the
+ones still open. This also catches a pane closed some way Jumpbox didn't
+initiate at all - e.g. tmux's own pane-close key, if someone's personal
+tmux config binds one.
 
 ## Mouse mode
 

@@ -12,13 +12,18 @@ A tree-driven SSH jump host, three tabs:
     │   Room 1      │ │ thin detail strip + [Connect] │
     │   Room 2      │ │                               │
     └───────────────┘ └───────────────────────────────┘
-  Sessions
-    Every host you currently have open, each in its own tmux pane to the
-    right of this one. Read-only - type `exit` in a pane (or let the
-    connection drop) to end it; the row disappears on its own.
-  Logs
-    A timestamped history of hosts you've jumped to this run, with a
-    Reconnect button.
+  Tags
+    Every tag used by any host, pulled from across the whole inventory -
+    not scoped to whatever room happens to be selected on the Dashboard.
+    Pick a tag on the left to list every host that carries it on the
+    right, each labelled with the location/room it actually lives in;
+    double click (or Enter) connects, same as the Dashboard.
+  Activity
+    Every host you've connected to this run, newest first. A still-open
+    one (its pane is alive) shows "● OPEN"; once that pane closes - typed
+    `exit`, or the connection just dropping - the row stays put as plain
+    history instead of disappearing. Select any row and hit Reconnect to
+    open it again.
 
 Pick a location in the tree (click it to expand and reveal its rooms), then
 click a room to list its hosts on the right - each host appears exactly once,
@@ -32,7 +37,7 @@ and this dashboard never leaves the screen. See `panes.py` for the mechanism.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from textual import events, on, work
@@ -62,23 +67,37 @@ from .dialogs import (
     HostFormDialog,
     LocationFormDialog,
     RoomFormDialog,
+    TagFormDialog,
 )
-from .panes import OpenSession
 
-BANNER = r"""
-     ██╗██╗   ██╗███╗   ███╗██████╗ ██████╗  ██████╗ ██╗  ██╗
-     ██║██║   ██║████╗ ████║██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝
-     ██║██║   ██║██╔████╔██║██████╔╝██████╔╝██║   ██║ ╚███╔╝
-██   ██║██║   ██║██║╚██╔╝██║██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗
-╚█████╔╝╚██████╔╝██║ ╚═╝ ██║██║     ██████╔╝╚██████╔╝██╔╝ ██╗
- ╚════╝  ╚═════╝ ╚═╝     ╚═╝╚═╝     ╚═════╝  ╚═════╝ ╚═╝  ╚═╝
-""".strip("\n")
+_BANNER_ROWS = [
+    r"     ██╗██╗   ██╗███╗   ███╗██████╗ ██████╗  ██████╗ ██╗  ██╗",
+    r"     ██║██║   ██║████╗ ████║██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝",
+    r"     ██║██║   ██║██╔████╔██║██████╔╝██████╔╝██║   ██║ ╚███╔╝",
+    r"██   ██║██║   ██║██║╚██╔╝██║██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗",
+    r"╚█████╔╝╚██████╔╝██║ ╚═╝ ██║██║     ██████╔╝╚██████╔╝██╔╝ ██╗",
+    r" ╚════╝  ╚═════╝ ╚═╝     ╚═╝╚═╝     ╚═════╝  ╚═════╝ ╚═╝  ╚═╝",
+]
+# Rows must all share one width: `#banner` is centred with `text-align:
+# center`, which centres each line of the Static's text independently. A
+# row even one cell narrower than the rest gets a different left pad than
+# its neighbours, and that mismatch shifts as the terminal is resized -
+# the letters appear to warp. Padding every row out to the widest one
+# keeps the centring offset identical for all of them at any width.
+_BANNER_WIDTH = max(len(row) for row in _BANNER_ROWS)
+BANNER = "\n".join(row.ljust(_BANNER_WIDTH) for row in _BANNER_ROWS)
 
 STATUS_COLOR = {
     Status.ONLINE: "#50fa7b",
     Status.DEGRADED: "#f1fa8c",
     Status.OFFLINE: "#ff5555",
 }
+
+# Mirrors $accent in styles.tcss. Rich markup embedded in a Python string
+# can't reach into Textual's own CSS variables, so this constant is the
+# one place to keep the two in sync by hand.
+ACCENT = "#b014e5"
+OPEN_COLOR = "#50fa7b"
 
 # One (bold, full-saturation) colour per location, cycling for any number
 # of them; its rooms use the paired lighter tint of the *same* hue, so a
@@ -92,7 +111,7 @@ LOCATION_PALETTE = [
     ("#69d2c1", "#a8e8db"),  # teal
 ]
 
-MAX_LOG_ENTRIES = 20
+MAX_ACTIVITY_ENTRIES = 20
 
 
 def _location_label(location: Location, color_index: int) -> str:
@@ -116,50 +135,67 @@ def _host_label(host: Host) -> str:
     )
 
 
-def _log_label(entry: "LogEntry") -> str:
-    stamp = entry.when.strftime("%Y-%m-%d %I:%M:%S %p")
-    host = entry.host
+def _tag_host_label(location: Location, room: Room, host: Host) -> str:
     color = STATUS_COLOR[host.status]
     return (
-        f"[dim]{stamp}[/]  {entry.location.icon} "
-        f"[dim]{entry.location.name} → {entry.room.name} →[/] "
-        f"[{color}]{host.name}[/]  [dim]{host.target}[/]"
+        f"{location.icon} [dim]{location.name} → {room.name}[/]  "
+        f"[{color}]●[/] [{color}]{host.name}[/]  [dim]{host.address}[/]  "
+        f"[{color}]{host.status.label}[/]"
     )
 
 
-def _session_label(session: OpenSession) -> str:
-    stamp = session.opened_at.strftime("%I:%M:%S %p")
-    host = session.host
+def _activity_label(entry: "ActivityEntry") -> str:
+    stamp = entry.opened_at.strftime("%Y-%m-%d %I:%M:%S %p")
+    host = entry.host
     color = STATUS_COLOR[host.status]
+    state = f"[bold {OPEN_COLOR}]● OPEN[/]" if entry.is_open else "[dim]closed[/]"
     return (
-        f"[dim]{stamp}[/]  [{color}]{host.name}[/]  [dim]{host.target}[/]"
+        f"[dim]{stamp}[/]  {entry.location.icon} "
+        f"[dim]{entry.location.name} → {entry.room.name} →[/] "
+        f"[{color}]{host.name}[/]  [dim]{host.target}[/]  {state}"
     )
 
 
 @dataclass
-class LogEntry:
-    """One timestamped "jumped to this host" entry shown on the Logs tab."""
+class ActivityEntry:
+    """One "you connected to this host" event, shown on the Activity tab.
 
-    when: datetime
+    Starts open the moment a pane is opened (`closed_at` is None, `pane_id`
+    set); `_reconcile_activity` fills in `closed_at` once tmux no longer has
+    that pane - the only way a session ever ends (see panes.py). The entry
+    stays in `self.activity` after that as plain history.
+    """
+
+    pane_id: str
+    host: Host
     location: Location
     room: Room
-    host: Host
+    opened_at: datetime
+    closed_at: datetime | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.closed_at is None
 
 
-class HostItem(ListItem):
-    """A selectable host row: single click previews, double click connects."""
+class _HostRow(ListItem):
+    """Shared single-click-preview / double-click-connect row for any list
+    of hosts you can open a pane to. `location`/`room` ride along on every
+    row (not just looked up from whatever's currently selected) so this
+    works the same whether the row came from the Dashboard's hosts list
+    (scoped to one room) or the Tags tab's (pulled from across the whole
+    inventory)."""
 
-    class DoubleClicked(Message):
-        def __init__(self, host: Host) -> None:
-            self.host = host
+    class Activated(Message):
+        def __init__(self, item: "_HostRow") -> None:
+            self.item = item
             super().__init__()
 
-    def __init__(self, host: Host) -> None:
-        super().__init__(classes="host-item")
+    def __init__(self, location: Location, room: Room, host: Host, *, classes: str) -> None:
+        super().__init__(classes=classes)
+        self.location = location
+        self.room = room
         self.host = host
-
-    def compose(self) -> ComposeResult:
-        yield Static(_host_label(self.host))
 
     def _on_click(self, event: events.Click) -> None:
         # Textual calls every matching handler up the MRO, so ListItem's
@@ -176,32 +212,56 @@ class HostItem(ListItem):
             except ValueError:
                 pass
         if event.chain >= 2:
-            self.post_message(self.DoubleClicked(self.host))
+            self.post_message(self.Activated(self))
 
 
-class LogItem(ListItem):
-    """A row in the connection log."""
+class HostItem(_HostRow):
+    """A selectable host row in the Dashboard's Hosts list."""
 
-    def __init__(self, entry: LogEntry) -> None:
-        super().__init__(classes="log-item")
+    def __init__(self, location: Location, room: Room, host: Host) -> None:
+        super().__init__(location, room, host, classes="host-item")
+
+    def compose(self) -> ComposeResult:
+        yield Static(_host_label(self.host))
+
+
+class TagHostItem(_HostRow):
+    """A host row on the Tags tab - same click behaviour as HostItem, but
+    labelled with the location/room that actually owns it, since these
+    rows span the whole inventory rather than one selected room."""
+
+    def __init__(self, location: Location, room: Room, host: Host) -> None:
+        super().__init__(location, room, host, classes="tag-host-item")
+
+    def compose(self) -> ComposeResult:
+        yield Static(_tag_host_label(self.location, self.room, self.host))
+
+
+class TagItem(ListItem):
+    """A row in the Tags tab's tag list: one per distinct tag in use, with
+    how many hosts across the whole inventory carry it."""
+
+    def __init__(self, tag: str, count: int) -> None:
+        super().__init__(classes="tag-item")
+        self.tag = tag
+        self.count = count
+
+    def compose(self) -> ComposeResult:
+        plural = "" if self.count == 1 else "s"
+        yield Static(
+            f"[bold {ACCENT}]#{self.tag}[/]  [dim]{self.count} host{plural}[/]"
+        )
+
+
+class ActivityItem(ListItem):
+    """A row on the Activity tab: one connection, open or closed."""
+
+    def __init__(self, entry: ActivityEntry) -> None:
+        super().__init__(classes="activity-item")
         self.entry = entry
 
     def compose(self) -> ComposeResult:
-        yield Static(_log_label(self.entry))
-
-
-class SessionItem(ListItem):
-    """A row for one open host pane. Read-only by design - the only way to
-    end a session is from inside its own pane (type `exit`, or just let
-    the connection drop); Jumpbox notices either within a second or two
-    and the row disappears on its own."""
-
-    def __init__(self, session: OpenSession) -> None:
-        super().__init__(classes="session-item")
-        self.session = session
-
-    def compose(self) -> ComposeResult:
-        yield Static(_session_label(self.session), classes="session-label")
+        yield Static(_activity_label(self.entry), classes="activity-label")
 
 
 class JumpboxApp(App):
@@ -222,10 +282,11 @@ class JumpboxApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.locations: list[Location] = []
+        self.tag_vocabulary: list[str] = []
         self._current_location: Location | None = None
         self._current_room: Room | None = None
-        self.logs: list[LogEntry] = []
-        self.open_sessions: list[OpenSession] = []
+        self._current_tag: str | None = None
+        self.activity: list[ActivityEntry] = []
         # Set once on_mount confirms this process is actually sitting in a
         # tmux pane - lets __main__.py kill the whole session on exit, and
         # lets _connect() refuse to open a pane it has nowhere to put.
@@ -234,6 +295,14 @@ class JumpboxApp(App):
         self._window_id = ""
         # Lets us clear the host search box without re-triggering a search.
         self._suppress_host_search = False
+
+    def notify(self, *args, **kwargs) -> None:
+        """No-op: toast popups are disabled app-wide.
+
+        Overriding here (rather than stripping every self.notify(...)
+        call) keeps all the existing call sites as one-line silencing.
+        """
+        return
 
     # ------------------------------------------------------------------ build
     def compose(self) -> ComposeResult:
@@ -274,23 +343,25 @@ class JumpboxApp(App):
                                     "▶ Connect", id="connect", variant="success"
                                 )
                                 yield Button("⟳ Refresh", id="refresh")
-            with TabPane("🖥 Sessions", id="sessions"):
-                with Vertical(id="sessions-pane"):
+            with TabPane("🏷 Tags", id="tags"):
+                with Horizontal(id="tags-body"):
+                    with Vertical(id="tags-pane"):
+                        with Horizontal(id="tag-toolbar"):
+                            yield Input(placeholder="Search tags…", id="tag-search")
+                            yield Button("+", id="tag-menu-btn", classes="add-btn")
+                        yield ListView(id="tag-list")
+                    with Vertical(id="tag-hosts-pane"):
+                        yield ListView(id="tag-hosts")
+            with TabPane("🕓 Activity", id="activity"):
+                with Vertical(id="activity-pane"):
                     yield Static(
-                        "Hosts you have open right now, each in its own pane "
-                        "to the right of this one. Type exit in a pane to end it.",
-                        id="sessions-caption",
+                        "Every host you've connected to this run - still-open "
+                        "ones show ● OPEN, closed ones stay as history.",
+                        id="activity-caption",
                     )
-                    yield ListView(id="session-list")
-            with TabPane("🕓 Logs", id="logs"):
-                with Vertical(id="logs-pane"):
-                    yield Static(
-                        "Timestamped history of hosts you've jumped to this run.",
-                        id="logs-caption",
-                    )
-                    yield ListView(id="log-list")
-                    with Horizontal(id="log-actions"):
-                        yield Button("↺ Reconnect", id="reconnect-log")
+                    yield ListView(id="activity-list")
+                    with Horizontal(id="activity-actions"):
+                        yield Button("↺ Reconnect", id="reconnect-activity")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -298,7 +369,8 @@ class JumpboxApp(App):
         self.query_one("#locations-pane").border_title = "LOCATIONS"
         self.query_one("#hosts-pane").border_title = "HOSTS"
         self.query_one("#detail").border_title = "DETAIL"
-        self.query_one("#sessions-pane").border_title = "SESSIONS"
+        self.query_one("#tags-pane").border_title = "TAGS"
+        self.query_one("#tag-hosts-pane").border_title = "HOSTS"
 
         tree = self.query_one("#locations", Tree)
         tree.show_root = False
@@ -337,16 +409,16 @@ class JumpboxApp(App):
                 timeout=10,
             )
 
-        self.locations = storage.load()
+        self.locations, self.tag_vocabulary = storage.load()
         await self._populate_locations()
-        await self._populate_sessions()
-        await self._populate_logs()
-        self.set_interval(1.0, self._reconcile_sessions)
+        await self._populate_tags()
+        await self._populate_activity()
+        self.set_interval(1.0, self._reconcile_activity)
 
     # --------------------------------------------------------------- populate
     async def _populate_locations(self, query: str = "") -> None:
         locations = fuzzy.filter_items(
-            query, self.locations, key=lambda loc: loc.search_text
+            query, self.locations, key=lambda loc: loc.search_candidates
         )
         tree = self.query_one("#locations", Tree)
         tree.clear()
@@ -401,39 +473,86 @@ class JumpboxApp(App):
             hosts = fuzzy.filter_items(
                 query, self._current_room.hosts, key=lambda h: h.search_text
             )
-            await view.extend(HostItem(host) for host in hosts)
+            await view.extend(
+                HostItem(self._current_location, self._current_room, host)
+                for host in hosts
+            )
         if hosts:
             view.index = 0
             self._show_detail(hosts[0])
         else:
             self._show_detail(None)
 
-    async def _populate_logs(self) -> None:
-        view = self.query_one("#log-list", ListView)
+    async def _populate_tags(self, query: str = "") -> None:
+        counts: dict[str, int] = {}
+        for location in self.locations:
+            for room in location.rooms:
+                for host in room.hosts:
+                    for tag in host.tags:
+                        counts[tag] = counts.get(tag, 0) + 1
+
+        # The vocabulary (managed from this tab's own "+" menu) is shown
+        # even for tags no host has yet (count 0); any tag a host already
+        # carries is shown too even if it's missing from the vocabulary
+        # (hand-edited data, or a tag deleted from the vocabulary after
+        # being used) - nothing real is ever hidden here.
+        all_tags = sorted(set(self.tag_vocabulary) | set(counts))
+        tags = fuzzy.filter_items(query, all_tags, key=lambda t: t)
+        view = self.query_one("#tag-list", ListView)
         await view.clear()
-        if not self.logs:
+
+        if not tags:
             await view.append(
                 ListItem(
                     Static(
-                        "[dim]No connections logged yet — connect to a host "
-                        "from the Dashboard tab.[/]"
+                        "[dim]No tags match.[/]"
+                        if query
+                        else "[dim]No tags yet — add one with the + button.[/]"
+                    )
+                )
+            )
+            await self._select_tag(None)
+            return
+
+        await view.extend(TagItem(tag, counts.get(tag, 0)) for tag in tags)
+        target = self._current_tag if self._current_tag in tags else tags[0]
+        view.index = tags.index(target)
+        await self._select_tag(target)
+
+    async def _populate_tag_hosts(self) -> None:
+        view = self.query_one("#tag-hosts", ListView)
+        await view.clear()
+        if self._current_tag is None:
+            await view.append(ListItem(Static("[dim]Select a tag to see its hosts.[/]")))
+            return
+        matches = [
+            (location, room, host)
+            for location in self.locations
+            for room in location.rooms
+            for host in room.hosts
+            if self._current_tag in host.tags
+        ]
+        if not matches:
+            await view.append(ListItem(Static("[dim]No hosts have this tag.[/]")))
+            return
+        await view.extend(
+            TagHostItem(location, room, host) for location, room, host in matches
+        )
+
+    async def _populate_activity(self) -> None:
+        view = self.query_one("#activity-list", ListView)
+        await view.clear()
+        if not self.activity:
+            await view.append(
+                ListItem(
+                    Static(
+                        "[dim]No activity yet — connect to a host from the "
+                        "Dashboard tab.[/]"
                     )
                 )
             )
             return
-        await view.extend(LogItem(entry) for entry in self.logs)
-
-    async def _populate_sessions(self) -> None:
-        view = self.query_one("#session-list", ListView)
-        await view.clear()
-        if not self.open_sessions:
-            await view.append(
-                ListItem(
-                    Static("[dim]No open sessions — connect to a host to open one.[/]")
-                )
-            )
-            return
-        await view.extend(SessionItem(session) for session in self.open_sessions)
+        await view.extend(ActivityItem(entry) for entry in self.activity)
 
     async def _select_room(self, location: Location, room: Room) -> None:
         if room is self._current_room:
@@ -449,6 +568,13 @@ class JumpboxApp(App):
             self._suppress_host_search = True
             host_search.value = ""
         await self._populate_hosts()
+
+    async def _select_tag(self, tag: str | None) -> None:
+        self._current_tag = tag
+        self.query_one("#tag-hosts-pane").border_title = (
+            f"HOSTS  ·  #{tag}" if tag else "HOSTS"
+        )
+        await self._populate_tag_hosts()
 
     def _show_detail(self, host: Host | None) -> None:
         body = self.query_one("#detail-body", Static)
@@ -510,15 +636,26 @@ class JumpboxApp(App):
             self._show_detail(event.item.host)
 
     @on(ListView.Selected, "#hosts")
+    @on(ListView.Selected, "#tag-hosts")
     def _on_host_selected(self, event: ListView.Selected) -> None:
         # Only reachable via the Enter key now (single click no longer
-        # posts Selected - see HostItem._on_click).
-        if isinstance(event.item, HostItem):
-            self._connect(event.item.host)
+        # posts Selected - see _HostRow._on_click).
+        if isinstance(event.item, _HostRow):
+            self._connect(event.item.host, event.item.location, event.item.room)
 
-    @on(HostItem.DoubleClicked)
-    def _on_host_double_clicked(self, event: HostItem.DoubleClicked) -> None:
-        self._connect(event.host)
+    @on(_HostRow.Activated)
+    def _on_host_row_activated(self, event: _HostRow.Activated) -> None:
+        item = event.item
+        self._connect(item.host, item.location, item.room)
+
+    @on(ListView.Highlighted, "#tag-list")
+    async def _on_tag_highlighted(self, event: ListView.Highlighted) -> None:
+        if isinstance(event.item, TagItem):
+            await self._select_tag(event.item.tag)
+
+    @on(Input.Changed, "#tag-search")
+    async def _on_tag_search(self, event: Input.Changed) -> None:
+        await self._populate_tags(event.value)
 
     @on(Button.Pressed, "#location-menu-btn")
     @work
@@ -548,6 +685,18 @@ class JumpboxApp(App):
         elif choice == "delete":
             await self._delete_host()
 
+    @on(Button.Pressed, "#tag-menu-btn")
+    @work
+    async def _on_tag_menu_button(self) -> None:
+        options = [("add-tag", "Add Tag")]
+        if self._current_tag is not None:
+            options.append(("delete", "Delete Selected"))
+        choice = await self.push_screen_wait(ActionMenu("Tags", options))
+        if choice == "add-tag":
+            await self._add_tag()
+        elif choice == "delete":
+            await self._delete_tag()
+
     @on(Button.Pressed, "#connect")
     def _on_connect_button(self) -> None:
         self.action_connect()
@@ -556,21 +705,20 @@ class JumpboxApp(App):
     async def _on_refresh_button(self) -> None:
         await self.action_refresh()
 
-    @on(Button.Pressed, "#reconnect-log")
-    async def _on_reconnect_button(self) -> None:
-        item = self.query_one("#log-list", ListView).highlighted_child
-        if isinstance(item, LogItem):
+    @on(Button.Pressed, "#reconnect-activity")
+    def _on_reconnect_button(self) -> None:
+        item = self.query_one("#activity-list", ListView).highlighted_child
+        if isinstance(item, ActivityItem):
             self._connect(item.entry.host, item.entry.location, item.entry.room)
-            await self._populate_logs()
         else:
-            self.notify("No log entry selected.", severity="warning")
+            self.notify("No activity entry selected.", severity="warning")
 
     @on(TabbedContent.TabActivated)
     async def _on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        if event.pane.id == "logs":
-            await self._populate_logs()
-        elif event.pane.id == "sessions":
-            await self._populate_sessions()
+        if event.pane.id == "activity":
+            await self._populate_activity()
+        elif event.pane.id == "tags":
+            await self._populate_tags(self.query_one("#tag-search", Input).value)
 
     @on(Button.Pressed, "#quit-btn")
     async def _on_quit_button(self) -> None:
@@ -591,16 +739,17 @@ class JumpboxApp(App):
         self._connect(host)
 
     async def action_refresh(self) -> None:
-        self.locations = storage.load()
+        self.locations, self.tag_vocabulary = storage.load()
         self._current_location = None
         self._current_room = None
         self.query_one("#location-search", Input).value = ""
         await self._populate_locations()
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
         self.notify("Inventory refreshed.", title="Jumpbox")
 
     # ------------------------------------------------------------- add/remove
     def _save(self) -> None:
-        storage.save(self.locations)
+        storage.save(self.locations, self.tag_vocabulary)
 
     async def _add_location(self) -> None:
         result = await self.push_screen_wait(LocationFormDialog())
@@ -647,6 +796,7 @@ class JumpboxApp(App):
                 self._current_location = None
                 self._current_room = None
             await self._populate_locations(self.query_one("#location-search", Input).value)
+            await self._populate_tags(self.query_one("#tag-search", Input).value)
             self.notify(f"Deleted location '{location.name}'.", title="Jumpbox")
 
         elif isinstance(node.data, Room):
@@ -667,6 +817,7 @@ class JumpboxApp(App):
                 self._current_location = None
                 self._current_room = None
             await self._populate_locations(self.query_one("#location-search", Input).value)
+            await self._populate_tags(self.query_one("#tag-search", Input).value)
             self.notify(f"Deleted room '{room.name}'.", title="Jumpbox")
 
     async def _add_host(self) -> None:
@@ -674,13 +825,14 @@ class JumpboxApp(App):
             self.notify("Select a room first.", severity="warning")
             return
         room = self._current_room
-        result = await self.push_screen_wait(HostFormDialog(room.name))
+        result = await self.push_screen_wait(HostFormDialog(room.name, self.tag_vocabulary))
         if result is None:
             return
         room.hosts.append(result)
         self._save()
         await self._populate_hosts(self.query_one("#host-search", Input).value)
         await self._populate_locations(self.query_one("#location-search", Input).value)
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
         self.notify(f"Added host '{result.name}' to {room.name}.", title="Jumpbox")
 
     async def _delete_host(self) -> None:
@@ -697,7 +849,49 @@ class JumpboxApp(App):
         self._save()
         await self._populate_hosts(self.query_one("#host-search", Input).value)
         await self._populate_locations(self.query_one("#location-search", Input).value)
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
         self.notify(f"Deleted host '{host.name}'.", title="Jumpbox")
+
+    async def _add_tag(self) -> None:
+        result = await self.push_screen_wait(TagFormDialog(self.tag_vocabulary))
+        if result is None:
+            return
+        self.tag_vocabulary = sorted(set(self.tag_vocabulary) | {result})
+        self._save()
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
+        self.notify(f"Added tag '#{result}'.", title="Jumpbox")
+
+    async def _delete_tag(self) -> None:
+        tag = self._current_tag
+        if tag is None:
+            self.notify("Select a tag first.", severity="warning")
+            return
+        affected = [
+            (room, host)
+            for location in self.locations
+            for room in location.rooms
+            for host in room.hosts
+            if tag in host.tags
+        ]
+        question = f"Are you sure you want to delete tag '#{tag}'?"
+        if affected:
+            question += (
+                f" It will be removed from {len(affected)} "
+                f"host{'s' if len(affected) != 1 else ''}."
+            )
+        confirmed = await self.push_screen_wait(ConfirmDialog(question))
+        if not confirmed:
+            return
+        self.tag_vocabulary = [t for t in self.tag_vocabulary if t != tag]
+        for room, host in affected:
+            room.hosts[room.hosts.index(host)] = replace(
+                host, tags=tuple(t for t in host.tags if t != tag)
+            )
+        self._save()
+        await self._populate_locations(self.query_one("#location-search", Input).value)
+        await self._populate_hosts(self.query_one("#host-search", Input).value)
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
+        self.notify(f"Deleted tag '#{tag}'.", title="Jumpbox")
 
     @staticmethod
     def _node_location(node) -> Location | None:
@@ -733,8 +927,11 @@ class JumpboxApp(App):
         # The first host splits off Jumpbox's own pane, to the right; every
         # host after that splits off the previously opened host pane,
         # below it - so the right-hand column just grows downward.
-        if self.open_sessions:
-            target_pane = self.open_sessions[-1].pane_id
+        open_entries = [entry for entry in self.activity if entry.is_open]
+        if open_entries:
+            # `self.activity` is newest-first, so the first still-open
+            # entry is the most recently opened pane.
+            target_pane = open_entries[0].pane_id
             stacked = True
         else:
             target_pane = self._jumpbox_pane_id
@@ -746,24 +943,40 @@ class JumpboxApp(App):
             self.notify(f"Couldn't open a pane for {host.name}: {exc}", severity="error")
             return
 
-        self.open_sessions.append(OpenSession(new_pane_id, host, datetime.now()))
-        self.run_worker(self._populate_sessions())
+        self.activity.insert(0, ActivityEntry(new_pane_id, host, location, room, datetime.now()))
+        self._trim_activity()
+        self.run_worker(self._populate_activity())
         self.notify(f"Opened {host.name} in a new pane.", title="Jumpbox")
 
-        if location is not None and room is not None:
-            self.logs.insert(0, LogEntry(datetime.now(), location, room, host))
-            del self.logs[MAX_LOG_ENTRIES:]
+    def _trim_activity(self) -> None:
+        """Cap closed history at MAX_ACTIVITY_ENTRIES, oldest closed entry
+        first to go - still-open entries are never trimmed, no matter how
+        many of them there are."""
+        kept: list[ActivityEntry] = []
+        closed_kept = 0
+        for entry in self.activity:
+            if entry.is_open:
+                kept.append(entry)
+            elif closed_kept < MAX_ACTIVITY_ENTRIES:
+                kept.append(entry)
+                closed_kept += 1
+        self.activity = kept
 
-    async def _reconcile_sessions(self) -> None:
+    async def _reconcile_activity(self) -> None:
         """The only way a session ends is from inside its own pane - typing
         `exit`, or the connection just dropping - so this is the only thing
-        that ever removes a row from the Sessions tab: poll which panes
-        tmux still actually has, and drop whichever tracked ones aren't in
-        that set any more."""
-        if self.tmux_session is None or not self.open_sessions:
+        that ever marks an Activity row closed: poll which panes tmux still
+        actually has, and close whichever tracked ones aren't in that set
+        any more (the row stays, just no longer "● OPEN")."""
+        open_entries = [entry for entry in self.activity if entry.is_open]
+        if self.tmux_session is None or not open_entries:
             return
         alive = panes.live_pane_ids(self._window_id)
-        if all(session.pane_id in alive for session in self.open_sessions):
+        if all(entry.pane_id in alive for entry in open_entries):
             return
-        self.open_sessions = [s for s in self.open_sessions if s.pane_id in alive]
-        await self._populate_sessions()
+        now = datetime.now()
+        for entry in open_entries:
+            if entry.pane_id not in alive:
+                entry.closed_at = now
+        self._trim_activity()
+        await self._populate_activity()

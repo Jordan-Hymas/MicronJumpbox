@@ -5,12 +5,15 @@ the core flow: theme, the locations -> rooms tree (with no duplicated host
 leaves), fuzzy search, room switching, single-click-preview vs
 double-click-connect on hosts, opening hosts as tmux panes (a real tmux is
 never required - `panes.open_pane`/`live_pane_ids` are monkeypatched so this
-runs anywhere), that a session only ever ends from inside its own pane (no
-Close button - reconciliation is what notices and prunes it), that two
-logins (even two people sharing one OS account) always get distinct tmux
+runs anywhere), the Tags tab (browsing/filtering hosts by tag across every
+location, and connecting to one with its own location/room rather than
+whatever's selected on the Dashboard), that a connection only ever closes
+from inside its own pane (no Close button - reconciliation is what notices
+and marks the Activity row closed, without ever deleting its history), that
+two logins (even two people sharing one OS account) always get distinct tmux
 session names, that connect_command() is a single direct hop with no
 needless jump, that forwarded-SSH-agent detection reflects a real socket
-and not just a leftover env var, the timestamped Logs tab, and that the
+and not just a leftover env var, the timestamped Activity tab, and that the
 ssh command run in each pane can't be hijacked by malicious host fields.
 
 JUMPBOX_DATA_DIR is pointed at a throwaway temp folder before anything
@@ -32,13 +35,13 @@ from pathlib import Path
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="jumpbox-smoke-")
 os.environ["JUMPBOX_DATA_DIR"] = _TEST_DATA_DIR
 
-from textual.widgets import Button, Input, TabbedContent, Tree
+from textual.widgets import Button, Input, Select, TabbedContent, Tree
 
 import jumpbox.app as appmod
 from jumpbox import storage
-from jumpbox.app import HostItem, JumpboxApp, LogItem, SessionItem
+from jumpbox.app import ActivityItem, HostItem, JumpboxApp, TagHostItem, TagItem
 from jumpbox.connect import connect_command
-from jumpbox.data import Host, Location, Room, Status, load_inventory
+from jumpbox.data import DEFAULT_TAGS, Host, Location, Room, Status, load_inventory
 
 
 def _count(app, kind) -> int:
@@ -86,17 +89,43 @@ async def main() -> None:
 
         tree = app.query_one("#locations", Tree)
         location_nodes = tree.root.children
-        assert len(location_nodes) == 2, f"expected 2 locations, got {len(location_nodes)}"
+        assert len(location_nodes) == 5, f"expected 5 locations, got {len(location_nodes)}"
         assert all(isinstance(n.data, Location) for n in location_nodes)
 
         room_nodes = location_nodes[0].children
-        assert len(room_nodes) == 2, f"expected 2 rooms, got {len(room_nodes)}"
+        assert len(room_nodes) == 4, f"expected 4 rooms, got {len(room_nodes)}"
         assert all(isinstance(n.data, Room) for n in room_nodes)
         assert all(len(n.children) == 0 for n in room_nodes), (
             "rooms must not nest host leaves - hosts only live in the hosts list"
         )
 
-        # First room (Datacenter 1) has 3 hosts.
+        # Location search must also match on *room* names, not just the
+        # location's own name/description - "IDF" isn't a building, it's a
+        # room inside three of them.
+        location_search = app.query_one("#location-search", Input)
+        location_search.value = "IDF"
+        await pilot.pause()
+        idf_locations = {n.data.name for n in tree.root.children}
+        assert idf_locations == {"A12", "B35", "C17"}, (
+            f"expected exactly the buildings with an IDF room, got {idf_locations}"
+        )
+
+        # Clearing rebuilds the tree from scratch, so anything holding a
+        # reference to a pre-search node (location_nodes, room_nodes) needs
+        # to be re-fetched rather than reused.
+        location_search.value = ""
+        await pilot.pause()
+        location_nodes = tree.root.children
+        assert len(location_nodes) == 5, "clearing search should restore every location"
+        room_nodes = location_nodes[0].children
+
+        # Narrowing to "IDF" moved the selected room to one of A12/B35/C17
+        # (the closest still-visible room) - move back to A14's first room
+        # explicitly so the rest of this test sees the state it expects.
+        tree.move_cursor(room_nodes[0])
+        await pilot.pause()
+
+        # First room (Fab 1) has 3 hosts.
         hosts = _count(app, HostItem)
         assert hosts == 3, f"expected 3 hosts in first room, got {hosts}"
 
@@ -105,7 +134,7 @@ async def main() -> None:
 
         # Fuzzy-filter narrows without zeroing out.
         search = app.query_one("#host-search")
-        search.value = "edge"
+        search.value = "ap"
         await pilot.pause()
         filtered = _count(app, HostItem)
         assert 1 <= filtered < 3, f"fuzzy search should narrow results, got {filtered}"
@@ -117,7 +146,7 @@ async def main() -> None:
         # Switch room via the tree (second room node) -> different host set.
         tree.move_cursor(room_nodes[1])
         await pilot.pause()
-        assert _count(app, HostItem) == 2, "second room (Datacenter 2) should have 2 hosts"
+        assert _count(app, HostItem) == 2, "second room (Fab 2) should have 2 hosts"
         assert app.query_one("#host-search").value == "", "search resets per room"
 
         # --- single click previews; double click needs a tmux session ----
@@ -134,14 +163,14 @@ async def main() -> None:
         await pilot.pause()
         assert app._highlighted_host() is target_host, "single click should move the preview"
         assert target_host.name in str(app.query_one("#detail-body").render())
-        assert not app.logs, "single click must not add a log entry"
+        assert not app.activity, "single click must not add an activity entry"
 
         # With no real tmux session (the real state in this headless run),
         # double click must refuse - never silently no-op, never crash.
         await pilot.click(target, times=2)
         await pilot.pause()
         assert not opened, "no tmux session means there's nowhere to open a pane"
-        assert not app.logs, "a refused connect must not be logged"
+        assert not app.activity, "a refused connect must not be logged"
 
         # Fake having a real tmux session, the same way on_mount would set
         # it up after a successful real detection.
@@ -156,11 +185,10 @@ async def main() -> None:
         assert first_target == "%0", "the first host pane must split off Jumpbox's own pane"
         assert first_stacked is False, "the first host pane must split sideways, not stacked"
         assert first_command == expected_command
-        assert len(app.open_sessions) == 1
-        assert app.open_sessions[0].host is target_host
-        assert app.open_sessions[0].pane_id == "%1"
-        assert len(app.logs) == 1, "a successful connect should add a log entry"
-        assert app.logs[0].host is target_host
+        assert len(app.activity) == 1
+        assert app.activity[0].host is target_host
+        assert app.activity[0].pane_id == "%1"
+        assert app.activity[0].is_open, "a fresh connection should start open"
 
         # A second host must stack *below the first host pane*, not split
         # off Jumpbox's pane again.
@@ -172,42 +200,80 @@ async def main() -> None:
         second_target, _, second_stacked = opened[1]
         assert second_target == "%1", "the second host pane must split off the first host pane"
         assert second_stacked is True, "every host after the first must stack below the last"
-        assert len(app.open_sessions) == 2
+        assert len(app.activity) == 2
+        assert app.activity[0].host is other_host, "activity is newest first"
 
-        # --- Sessions tab lists every open host, read-only ---------------
-        app.query_one(TabbedContent).active = "sessions"
+        # --- Tags tab: browse/filter hosts by tag across the *whole*
+        # inventory, not just whatever room is selected on the Dashboard ---
+        app.query_one(TabbedContent).active = "tags"
         await pilot.pause()
-        session_items = list(app.query(SessionItem))
-        assert len(session_items) == 2, f"expected 2 open sessions, got {len(session_items)}"
+        tag_counts = {item.tag: item.count for item in app.query(TagItem)}
+        assert tag_counts.get("core-switch") == 2, (
+            f"expected 2 hosts tagged 'core-switch' across both locations, got {tag_counts}"
+        )
 
-        # There's no Close button - a session only ever ends from inside
+        tag_search = app.query_one("#tag-search", Input)
+        tag_search.value = "core-switch"
+        await pilot.pause()
+        assert [item.tag for item in app.query(TagItem)] == ["core-switch"], (
+            "fuzzy search should narrow the tag list down to the match"
+        )
+
+        tag_hosts = list(app.query(TagHostItem))
+        assert len(tag_hosts) == 2, f"expected 2 hosts tagged core-switch, got {len(tag_hosts)}"
+        assert {item.host.name for item in tag_hosts} == {"us1-b14-core1", "us1-b25-core1"}, (
+            "the core-switch tag should pull hosts from every location, not just one"
+        )
+        assert len({item.location.name for item in tag_hosts}) == 2, (
+            "these two hosts must come from two different locations"
+        )
+
+        # Double-clicking a Tags-tab row connects it using *that* host's own
+        # location/room, not whatever happens to be selected on the Dashboard.
+        core_switch_target = tag_hosts[0]
+        await pilot.click(core_switch_target, times=2)
+        await pilot.pause()
+        assert len(opened) == 3, "double click on a Tags-tab host should connect it"
+        assert app.activity[0].host is core_switch_target.host
+        assert app.activity[0].location is core_switch_target.location
+        assert app.activity[0].room is core_switch_target.room
+
+        tag_search.value = ""
+        await pilot.pause()
+
+        # --- Activity tab lists every connection, newest first -----------
+        app.query_one(TabbedContent).active = "activity"
+        await pilot.pause()
+        activity_items = list(app.query(ActivityItem))
+        assert len(activity_items) == 3, f"expected 3 activity rows, got {len(activity_items)}"
+        assert all("OPEN" in str(item.query_one("Static").render()) for item in activity_items), (
+            "every connection here is still open, each row should say so"
+        )
+
+        # There's no Close button - a connection only ever ends from inside
         # its own pane (typed `exit`, or the connection just dropping),
         # simulated here by tmux simply no longer reporting that one pane.
-        first_pane_id = app.open_sessions[0].pane_id
-        live_panes.discard(first_pane_id)
-        await app._reconcile_sessions()
+        oldest_pane_id = app.activity[-1].pane_id
+        live_panes.discard(oldest_pane_id)
+        await app._reconcile_activity()
         await pilot.pause()
-        assert len(app.open_sessions) == 1, "ending one session must not touch the other"
-        assert app.open_sessions[0].host is other_host
-        assert len(list(app.query(SessionItem))) == 1
+        assert app.activity[-1].closed_at is not None, "the closed pane's entry should close"
+        assert all(e.is_open for e in app.activity[:-1]), "ending one must not touch the others"
+        assert len(app.activity) == 3, "a closed entry stays as history, never removed"
+        rendered = [str(item.query_one("Static").render()) for item in app.query(ActivityItem)]
+        assert sum("OPEN" in r for r in rendered) == 2, "exactly 2 rows should still say OPEN"
 
-        # And once every remaining pane is gone too, the list empties out.
+        # And once every remaining pane is gone too, all three stay as
+        # history - Activity never empties out just because panes closed.
         live_panes.clear()
-        await app._reconcile_sessions()
+        await app._reconcile_activity()
         await pilot.pause()
-        assert not app.open_sessions, "reconciliation must drop panes tmux no longer has"
-        assert not list(app.query(SessionItem))
-
-        # Logs tab should still carry the full history with real timestamps.
-        assert len(app.logs) == 2, "both connects should have been logged"
-        app.query_one(TabbedContent).active = "logs"
-        await pilot.pause()
-        log_items = list(app.query(LogItem))
-        assert len(log_items) == len(app.logs), (
-            f"logs tab should show {len(app.logs)} entries, got {len(log_items)}"
-        )
-        stamp = log_items[0].entry.when.strftime("%Y-%m-%d %I:%M:%S %p")
-        assert stamp in str(app.query_one(LogItem).query_one("Static").render())
+        assert all(not e.is_open for e in app.activity), "every entry should now be closed"
+        assert len(app.activity) == 3, "closed entries remain as history"
+        rendered = [str(item.query_one("Static").render()) for item in app.query(ActivityItem)]
+        assert not any("OPEN" in r for r in rendered)
+        stamp = app.activity[0].opened_at.strftime("%Y-%m-%d %I:%M:%S %p")
+        assert stamp in rendered[0]
 
         # Top-right exit button exists and is wired to quit.
         quit_btn = app.query_one("#quit-btn", Button)
@@ -241,7 +307,7 @@ async def main() -> None:
 
         # The whole point: a brand new process reading the same data dir
         # (simulating "exit, then relaunch") must see the new location too.
-        reloaded = storage.load()
+        reloaded, _reloaded_tags = storage.load()
         assert any(loc.name == "Warehouse 9" for loc in reloaded), (
             "added location must survive a fresh storage.load() (simulated restart)"
         )
@@ -255,6 +321,107 @@ async def main() -> None:
         assert len(app.locations) == before_locations + 1, "empty name must not add"
         app.screen.query_one("#form-cancel", Button).press()
         await _wait_until(pilot, _modal_closed)
+
+        # --- Tags tab: add a new tag to the prebuilt vocabulary -----------
+        before_tags = set(app.tag_vocabulary)
+        app.run_worker(app._add_tag())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#f-name", Input).value = "vpn"
+        app.screen.query_one("#form-add", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert set(app.tag_vocabulary) == before_tags | {"vpn"}, (
+            "add-tag should append to the vocabulary"
+        )
+
+        # A duplicate name (case-insensitive) must be rejected, not crash
+        # or add a second copy.
+        app.run_worker(app._add_tag())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#f-name", Input).value = "VPN"
+        app.screen.query_one("#form-add", Button).press()
+        await pilot.pause()
+        assert _modal_open(), "duplicate tag name must keep the form open"
+        assert app.tag_vocabulary.count("vpn") == 1, "must not add a duplicate"
+        app.screen.query_one("#form-cancel", Button).press()
+        await _wait_until(pilot, _modal_closed)
+
+        # --- add host: drives the real modal form, including the tag
+        # picker - a Select of the vocabulary plus an Add button moves the
+        # chosen tag into a row of removable chips below it -------------
+        host_room = app._current_room
+        before_host_count = len(host_room.hosts)
+        app.run_worker(app._add_host())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#f-name", Input).value = "edge-test-09"
+        app.screen.query_one("#f-address", Input).value = "10.50.0.9"
+        app.screen.query_one("#f-username", Input).value = "operator"
+
+        tag_select = app.screen.query_one("#f-tag-select", Select)
+        tag_add = app.screen.query_one("#f-tag-add", Button)
+        for tag in ("switch", "vpn", "router"):
+            tag_select.value = tag
+            tag_add.press()
+            await pilot.pause()
+        assert len(list(app.screen.query(".tag-chip"))) == 3, (
+            "each chosen tag should get its own removable chip"
+        )
+
+        # Removing the middle chip ("vpn") must drop only that one tag.
+        app.screen.query_one("#chip-1", Button).press()
+        await pilot.pause()
+        chip_labels = [str(b.label) for b in app.screen.query(".tag-chip")]
+        assert chip_labels == ["#switch ✕", "#router ✕"], (
+            f"expected switch+router left after removing the middle chip, got {chip_labels}"
+        )
+
+        app.screen.query_one("#form-add", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert len(host_room.hosts) == before_host_count + 1, "add-host should append"
+        new_host = host_room.hosts[-1]
+        assert new_host.name == "edge-test-09"
+        assert new_host.tags == ("switch", "router"), (
+            f"picker should commit only the chips left after removal, got {new_host.tags!r}"
+        )
+
+        # The new host's tags should show up on the Tags tab too.
+        app.query_one(TabbedContent).active = "tags"
+        await pilot.pause()
+        assert {item.tag for item in app.query(TagItem)} >= {"switch", "router", "vpn"}, (
+            "the new host's tags (and the still-unused 'vpn') should appear on the Tags tab"
+        )
+
+        # --- delete tag: a never-used tag removes cleanly, a used one
+        # cascades and strips itself out of every host that has it -------
+        tag_search = app.query_one("#tag-search", Input)
+        tag_search.value = "vpn"
+        await pilot.pause()
+        assert app._current_tag == "vpn"
+        app.run_worker(app._delete_tag())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#confirm-yes", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert "vpn" not in app.tag_vocabulary, "unused tag should be removed from the vocabulary"
+
+        tag_search.value = "router"
+        await pilot.pause()
+        assert app._current_tag == "router"
+        app.run_worker(app._delete_tag())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#confirm-yes", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert "router" not in app.tag_vocabulary, "deleted tag should leave the vocabulary"
+        # `_delete_tag` replaces the affected Host (frozen dataclasses can't
+        # be mutated in place), so look the row up fresh rather than reuse
+        # the now-stale `new_host` reference from before the cascade.
+        updated_host = next(h for h in host_room.hosts if h.name == "edge-test-09")
+        assert updated_host.tags == ("switch",), (
+            f"deleting an in-use tag must strip it from every host that had it, got {updated_host.tags!r}"
+        )
+
+        tag_search.value = ""
+        await pilot.pause()
+        app.query_one(TabbedContent).active = "dashboard"
+        await pilot.pause()
 
         # --- delete host: Cancel must protect, Delete must remove --------
         host_before = app._highlighted_host()
@@ -273,7 +440,7 @@ async def main() -> None:
         await _wait_until(pilot, _modal_closed)
         assert host_before not in room_ref.hosts, "Confirm should delete"
 
-        reloaded = storage.load()
+        reloaded, _reloaded_tags = storage.load()
         reloaded_names = {
             host.name for loc in reloaded for room in loc.rooms for host in room.hosts
         }
@@ -415,19 +582,26 @@ async def main() -> None:
     # discarded - it gets backed up aside and a fresh demo seed takes over.
     path = storage.inventory_path()
     path.write_text("{not valid json", encoding="utf-8")
-    recovered = storage.load()
-    assert len(recovered) == 2, "corrupt file should fall back to the demo seed"
+    recovered, recovered_tags = storage.load()
+    assert len(recovered) == 5, "corrupt file should fall back to the demo seed"
+    assert recovered_tags == sorted(DEFAULT_TAGS), (
+        "corrupt file should fall back to the default tag vocabulary too"
+    )
     backups = list(path.parent.glob(f"{path.name}.bad-*"))
     assert backups, "corrupt file should be renamed aside, not deleted"
 
     print(
-        "SMOKE OK — theme, locations/rooms tree (no dup hosts), fuzzy search, "
-        "room switch, no-tmux refusal, pane-opening/stacking, exit-only pane "
-        "reconciliation, mouse-mode detection, per-login session isolation, "
-        "direct (no-jump) connect commands, forwarded-agent detection, logs "
-        "with timestamps, quit button, add/delete with confirmation, "
-        "persistence across restarts, corrupt-file recovery, and "
-        "connect-command injection safety all good."
+        "SMOKE OK — theme, locations/rooms tree (no dup hosts), fuzzy search "
+        "(including locations matched by a room name like IDF/MDF), room "
+        "switch, no-tmux refusal, pane-opening/stacking, Tags tab "
+        "(cross-location browse/filter/connect, managed vocabulary with "
+        "add/delete + Select-based tag picker with removable chips), "
+        "exit-only Activity reconciliation (closed entries kept as "
+        "history), mouse-mode detection, per-login session isolation, "
+        "direct (no-jump) connect commands, forwarded-agent detection, "
+        "Activity timestamps, quit button, add/delete with confirmation "
+        "(including tagged hosts), persistence across restarts, "
+        "corrupt-file recovery, and connect-command injection safety all good."
     )
 
 

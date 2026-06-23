@@ -53,6 +53,25 @@ def score(query: str, text: str) -> float | None:
     return total - len(t) * 0.01
 
 
+def best_score(query: str, texts: str | Iterable[str]) -> float | None:
+    """Like `score()`, but `texts` may be several independent strings -
+    returns whichever one scores best, or `None` if none of them match.
+
+    Scoring each text separately (rather than the caller concatenating
+    them into one blob first) matters for longer ones: a short query is
+    far more likely to turn up as an accidental subsequence somewhere in
+    one long combined string than it is to be a genuinely good match
+    against any single short one.
+    """
+    candidates = [texts] if isinstance(texts, str) else list(texts)
+    best: float | None = None
+    for text in candidates:
+        s = score(query, text)
+        if s is not None and (best is None or s > best):
+            best = s
+    return best
+
+
 def filter_items(
     query: str,
     items: Iterable[T],
@@ -60,8 +79,10 @@ def filter_items(
 ) -> list[T]:
     """Return `items` that match `query`, best matches first.
 
-    `key` maps an item to the string that should be matched against.
-    With an empty query the original order is preserved.
+    `key` maps an item to either the string to match against, or an
+    iterable of independent candidate strings (see `best_score()`) - an
+    item matches if any one of them does. With an empty query the
+    original order is preserved.
     """
 
     if not query.strip():
@@ -69,7 +90,7 @@ def filter_items(
 
     scored: list[tuple[float, int, T]] = []
     for index, item in enumerate(items):
-        s = score(query, key(item))
+        s = best_score(query, key(item))
         if s is not None:
             # `index` keeps the sort stable for equal scores.
             scored.append((s, index, item))

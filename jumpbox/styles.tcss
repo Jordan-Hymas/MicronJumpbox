@@ -134,11 +134,11 @@ Input:focus {
     border: tall $accent;
 }
 
-#location-toolbar, #host-toolbar {
+#location-toolbar, #host-toolbar, #tag-toolbar {
     height: auto;
 }
 
-#location-toolbar Input, #host-toolbar Input {
+#location-toolbar Input, #host-toolbar Input, #tag-toolbar Input {
     width: 1fr;
 }
 
@@ -197,65 +197,76 @@ ListView:focus > ListItem.-highlight {
     margin-left: 1;
 }
 
-/* ---- sessions tab ----------------------------------------------------- */
-#sessions-pane {
+/* ---- tags tab ---------------------------------------------------------
+   Mirrors the Dashboard's Locations|Hosts split: a narrower bordered list
+   of tags on the left, the matching hosts filling the rest on the right. */
+#tags-body {
     height: 1fr;
-    padding: 1 2;
+    padding: 0 2 1 2;
 }
 
-#sessions-caption {
-    height: auto;
-    color: $text-muted;
-    padding-bottom: 1;
-}
-
-#session-list {
+#tags-pane {
+    width: 44;
     height: 1fr;
-    background: transparent;
     border: round $primary;
+    border-title-color: $accent;
+    border-title-align: left;
     padding: 1;
-    overflow-y: auto;
+    margin-right: 2;
 }
 
-.session-item {
-    height: auto;
-    padding: 0;
-    margin-bottom: 1;
-}
-
-.session-label {
+#tag-hosts-pane {
     width: 1fr;
-    height: auto;
-    content-align: left middle;
-}
-
-/* ---- logs tab ------------------------------------------------------- */
-#logs-pane {
     height: 1fr;
-    padding: 1 2;
+    border: round $primary;
+    border-title-color: $accent;
+    border-title-align: left;
+    padding: 1;
 }
 
-#logs-caption {
-    height: auto;
-    color: $text-muted;
-    padding-bottom: 1;
-}
-
-#log-list {
+#tag-list, #tag-hosts {
     height: 1fr;
     background: transparent;
-    border: round $primary;
-    padding: 1;
+    border: none;
+    padding: 0;
     overflow-y: auto;
 }
 
-.log-item {
+.tag-item, .tag-host-item {
     height: auto;
     padding: 0;
     margin-bottom: 0;
 }
 
-#log-actions {
+/* ---- activity tab ------------------------------------------------------
+   The merged Sessions+Logs feed: every connection this run, newest first,
+   open ones marked "● OPEN" and closed ones left in place as history. */
+#activity-pane {
+    height: 1fr;
+    padding: 1 2;
+}
+
+#activity-caption {
+    height: auto;
+    color: $text-muted;
+    padding-bottom: 1;
+}
+
+#activity-list {
+    height: 1fr;
+    background: transparent;
+    border: round $primary;
+    padding: 1;
+    overflow-y: auto;
+}
+
+.activity-item {
+    height: auto;
+    padding: 0;
+    margin-bottom: 0;
+}
+
+#activity-actions {
     height: auto;
     align-horizontal: right;
     margin-top: 1;
@@ -315,6 +326,43 @@ ModalScreen {
 
 .field-group.left {
     margin-right: 2;
+}
+
+/* ---- host form: tag picker --------------------------------------------
+   A Select (the prebuilt vocabulary) plus an Add button moves the chosen
+   tag into the chip row below - each chip is its own small removable
+   button, since a host can carry more than one tag. */
+#f-tag-select {
+    width: 1fr;
+}
+
+#f-tag-add {
+    margin-left: 1;
+    height: 3;
+}
+
+#f-tag-chips {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.tag-chip {
+    margin-right: 1;
+    min-width: 0;
+    color: $accent;
+    border: round $accent 50%;
+    background: $panel;
+}
+.tag-chip:hover {
+    color: $text;
+    background: #ff5555 35%;
+    border: round #ff5555;
+}
+
+.tag-chip-empty {
+    color: $text-muted;
+    height: 3;
+    content-align: left middle;
 }
 
 #form-error {

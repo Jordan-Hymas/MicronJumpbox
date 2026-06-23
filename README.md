@@ -54,13 +54,15 @@ MicronJumpbox/
 
 ## Data & persistence
 
-Every location/room/host you add or delete is written to a JSON file at
-`~/.jumpbox/inventory.json` on whichever machine the app is running on.
+Every location/room/host you add or delete, and the Tags tab's tag
+vocabulary, is written to a JSON file at `~/.jumpbox/inventory.json` on
+whichever machine the app is running on.
 
 - **First run:** that file doesn't exist yet, so the app seeds it from the
-  built-in demo data in `data.py`, then writes it out. From then on, the file
-  is the source of truth — `data.py`'s demo set is only ever used again if
-  the file goes missing.
+  built-in demo data in `data.py` (five buildings' worth of network gear -
+  switches, APs, routers, firewalls), then writes it out. From then on, the
+  file is the source of truth — `data.py`'s demo set is only ever used
+  again if the file goes missing.
 - **Every add/delete** writes the full inventory back to disk immediately
   (atomically — a crash mid-write can't corrupt it).
 - **F5 / Refresh** re-reads the file from disk (handy if it was edited by
@@ -125,9 +127,11 @@ configuration needed:
    - This box's `sshd` needs to allow it too - `AllowAgentForwarding yes`
      in `/etc/ssh/sshd_config` (the default on most distros; check if
      forwarding doesn't seem to work).
-   - **Jumpbox tells you on startup** whether it actually found a forwarded
-     agent (`$SSH_AUTH_SOCK` set *and* the socket itself exists, not just
-     the env var) - watch for that notification right after launch.
+   - Jumpbox checks for a forwarded agent (`$SSH_AUTH_SOCK` set *and* the
+     socket itself exists, not just the env var) on startup, but toast
+     notifications are disabled app-wide (`App.notify()` is a no-op in
+     `app.py`) - there's no on-screen heads-up, so if you need to confirm
+     it found one, check `$SSH_AUTH_SOCK` yourself in the shell.
 2. **A key this box already has.** If this box's own user has a key
    (`~/.ssh/id_ed25519`, etc.) that the target host already trusts, that
    works too, agent or not - same as running `ssh` by hand here would.
@@ -136,12 +140,21 @@ If neither applies for a given host, ssh just falls back to its normal
 password prompt, exactly as if you'd typed the command yourself - nothing
 breaks, it's just not passwordless for that one host yet.
 
-The **🖥 Sessions** tab is a read-only list of what's currently open - a
-1-second background check notices a pane that closed (typed `exit`, a
-dropped connection) and drops it from the list automatically, so it never
-shows a session that's already gone. **Quitting Jumpbox (Ctrl+Q) kills the
-whole tmux session** - dashboard and every open host pane - and drops you
-back to a plain shell.
+The **🕓 Activity** tab lists every connection made this run, newest
+first - a 1-second background check notices a pane that closed (typed
+`exit`, a dropped connection) and marks that row closed automatically, but
+it's never removed: closed rows stay as history (capped at the last 20),
+so the tab doubles as both "what's open right now" (● OPEN) and a log of
+everything you've connected to. Select any row and hit Reconnect to open
+it again. **Quitting Jumpbox (Ctrl+Q) kills the whole tmux session** -
+dashboard and every open host pane - and drops you back to a plain shell.
+
+The **🏷 Tags** tab browses hosts by tag across every location at once
+(e.g. every switch, regardless of which building it's in) instead of
+drilling into one room at a time. Tags themselves are a managed vocabulary
+- add or delete one from this tab's own "+" menu - and the Add Host form's
+tag picker only offers tags from that list, so it stays a curated set
+instead of free-typed one-offs.
 
 ### Always starts fresh
 
@@ -221,15 +234,17 @@ This drives the real app headlessly and, among everything else, checks that
 connecting opens panes in the right place (first one beside Jumpbox, every
 one after stacked below the last) running a single direct hop with no
 needless jump, that a pane ending on its own (typed `exit`, dropped
-connection) gets noticed and removed from the Sessions list without
-touching any other open session, that two logins - even two people sharing
-one OS account - always get distinct session names, that forwarded-agent
-detection reflects a real socket rather than a stale env var, and that
-malicious host fields (free text from the Add Host form) can never inject
-extra shell commands into the line that ends up running in a real pane.
-tmux itself is mocked out, so this never needs (or touches) a real session
-- opening an actual pane and typing `exit` in it to watch the layout
-reflow is still worth doing by hand once.
+connection) gets noticed and marked closed on the Activity tab - as
+history, not removed - without touching any other open connection, that
+the Tags tab pulls hosts from across every location for a given tag, that
+two logins - even two people sharing one OS account - always get distinct
+session names, that forwarded-agent detection reflects a real socket
+rather than a stale env var, and that malicious host fields (free text
+from the Add Host form) can never inject extra shell commands into the
+line that ends up running in a real pane. tmux itself is mocked out, so
+this never needs (or touches) a real session - opening an actual pane and
+typing `exit` in it to watch the layout reflow is still worth doing by
+hand once.
 
 To regenerate the UI preview screenshot:
 
@@ -243,3 +258,7 @@ To regenerate the UI preview screenshot:
 - Pane sizing currently just halves whatever's left each time a host is
   added (so the column isn't perfectly even past 2-3 hosts) - revisit with
   `select-layout` if that turns out to matter in practice.
+- Going from this demo inventory to the real one: see
+  [docs/DEPLOYMENT_PLAN.md](docs/DEPLOYMENT_PLAN.md) for network
+  reachability, bulk-importing the real host list, and how SSH
+  credentials should work once SSO is involved.

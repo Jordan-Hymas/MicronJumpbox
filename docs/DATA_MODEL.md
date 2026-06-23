@@ -3,9 +3,9 @@
 ## The hierarchy
 
 ```
-Location  (a site/building, e.g. "Production Floor")
- └── Room    (a sub-location, e.g. "Datacenter 1")
-      └── Host   (a single SSH target, e.g. "fab-edge-01")
+Location  (a site/building, e.g. "A14")
+ └── Room    (a sub-location, e.g. "MDF")
+      └── Host   (a single SSH target, e.g. "us1-b14-sw1")
 ```
 
 Three frozen dataclasses in `data.py`:
@@ -95,25 +95,26 @@ The in-memory list is mirrored to a JSON file:
 {
   "version": 1,
   "saved_at": "2026-06-21T04:00:00+00:00",
+  "tags": ["access-point", "core-switch", "distribution-switch", "firewall", "router", "switch"],
   "locations": [
     {
-      "name": "Production Floor",
-      "description": "Fab-facing production systems",
+      "name": "A14",
+      "description": "Fab + core datacenter building",
       "icon": "🏭",
       "rooms": [
         {
-          "name": "Datacenter 1",
-          "description": "Primary edge + MES systems",
+          "name": "MDF",
+          "description": "Building A14 main distribution frame",
           "hosts": [
             {
-              "name": "fab-edge-01",
-              "address": "10.20.0.11",
-              "username": "operator",
+              "name": "us1-b14-sw1",
+              "address": "10.14.1.2",
+              "username": "netadmin",
               "port": 22,
-              "description": "Edge gateway / line A",
-              "os": "Ubuntu 22.04",
+              "description": "Fab 1 access switch",
+              "os": "Cisco IOS-XE 17.9",
               "status": "online",
-              "tags": ["gateway", "lineA"]
+              "tags": ["switch"]
             }
           ]
         }
@@ -126,10 +127,10 @@ The in-memory list is mirrored to a JSON file:
 Key behaviors, all in `storage.py`:
 
 - **First run**: `inventory.json` doesn't exist yet → `load()` seeds it
-  from `data.py`'s built-in demo data (two locations, "Production Floor"
-  and "Engineering Lab", with a handful of demo hosts each) and writes it
-  out immediately. From then on the file is authoritative - the demo seed
-  is only ever used again if the file goes missing entirely.
+  from `data.py`'s built-in demo data (five buildings' worth of network
+  gear - switches, APs, routers, firewalls - one per `Status`/`Host` field)
+  and writes it out immediately. From then on the file is authoritative -
+  the demo seed is only ever used again if the file goes missing entirely.
 - **Every add/delete** calls `_save()` (`app.py`), which writes the
   **entire** inventory back out, not a diff. `save()` writes to a
   `.tmp` sibling file first and `os.replace()`s it into place - that
@@ -144,6 +145,14 @@ Key behaviors, all in `storage.py`:
 - **F5 / Refresh** re-reads the file from disk into `self.locations` and
   rebuilds the views. It does *not* reset to the demo seed - that only
   happens on a missing or corrupt file.
+- **The tag vocabulary** (`load()`'s second `Inventory` field) is the
+  Tags tab's prebuilt list - managed from that tab's own "+" menu (Add
+  Tag / Delete Selected), independent of which tags any host actually
+  has. The Add Host form's tag picker only offers tags from this list.
+  Deleting one strips it from every host that had it, not just the
+  vocabulary. Loading a file saved before this existed (no `"tags"` key)
+  derives a starting vocabulary from `data.py`'s `DEFAULT_TAGS` unioned
+  with whatever tags hosts already carry, so nothing in use disappears.
 - **`$JUMPBOX_DATA_DIR`** overrides the `~/.jumpbox` directory entirely.
   This exists for tests (`tests/smoke.py` points it at a fresh temp
   directory before anything else imports `jumpbox`, so the test suite

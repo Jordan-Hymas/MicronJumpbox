@@ -26,6 +26,10 @@ Read them in this order if you're new to the codebase:
    needed to get in without typing a password.
 7. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - symptom → cause → fix, for
    the specific bugs that came up building this and how they were diagnosed.
+8. **[DEPLOYMENT_PLAN.md](DEPLOYMENT_PLAN.md)** - the open items for going
+   from a dev machine to the real jump-host VM: network reachability to
+   the actual switches/APs/routers/firewalls, bulk-loading the real host
+   list, and how SSH credentials should work once SSO is in the picture.
 
 ## The one-paragraph version
 

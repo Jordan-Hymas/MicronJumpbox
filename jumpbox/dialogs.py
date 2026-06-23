@@ -13,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, Select, Static
 
 from .data import Host, Location, Room, Status
 
@@ -149,12 +149,50 @@ class RoomFormDialog(_FormDialog):
         self.dismiss(Room(name=name, description=description, hosts=[]))
 
 
-class HostFormDialog(_FormDialog):
-    """Add a new Host to whichever Room is currently selected."""
+class TagFormDialog(_FormDialog):
+    """Add a new tag to the prebuilt vocabulary offered on the Add Host
+    form's tag picker (managed from the Tags tab's own "+" menu)."""
 
-    def __init__(self, room_name: str) -> None:
+    def __init__(self, existing_tags: list[str]) -> None:
+        super().__init__()
+        self._existing_lower = {t.lower() for t in existing_tags}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog-box", id="form-box"):
+            yield Static("Add Tag", classes="dialog-title")
+            yield Static("Name", classes="field-label")
+            yield Input(placeholder="e.g. vpn-concentrator", id="f-name")
+            yield Static("", id="form-error")
+            with Horizontal(classes="dialog-actions"):
+                yield Button("Cancel", id="form-cancel")
+                yield Button("Add", id="form-add", variant="success")
+
+    @on(Button.Pressed, "#form-add")
+    def _on_add(self) -> None:
+        name = self.query_one("#f-name", Input).value.strip()
+        if not name:
+            self._error("Name is required.")
+            return
+        if name.lower() in self._existing_lower:
+            self._error(f"'{name}' already exists.")
+            return
+        self.dismiss(name)
+
+
+class HostFormDialog(_FormDialog):
+    """Add a new Host to whichever Room is currently selected.
+
+    Tags are picked from the prebuilt vocabulary (managed on the Tags tab)
+    rather than typed freehand - a `Select` dropdown plus an Add button
+    moves the chosen tag into a running list of "chips" below it, each
+    removable on its own, since a host can carry more than one.
+    """
+
+    def __init__(self, room_name: str, tag_vocabulary: list[str]) -> None:
         super().__init__()
         self._room_name = room_name
+        self._tag_vocabulary = tag_vocabulary
+        self._chosen_tags: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog-box wide", id="form-box"):
@@ -181,10 +219,54 @@ class HostFormDialog(_FormDialog):
 
             yield Static("Description", classes="field-label")
             yield Input(placeholder="optional", id="f-description")
+
+            yield Static("Tags", classes="field-label")
+            with Horizontal(classes="field-row"):
+                yield Select(
+                    [(tag, tag) for tag in self._tag_vocabulary],
+                    prompt="Choose a tag…",
+                    id="f-tag-select",
+                )
+                yield Button("+ Add", id="f-tag-add", classes="add-btn")
+            yield Horizontal(id="f-tag-chips")
+
             yield Static("", id="form-error")
             with Horizontal(classes="dialog-actions"):
                 yield Button("Cancel", id="form-cancel")
                 yield Button("Add", id="form-add", variant="success")
+
+    async def on_mount(self) -> None:
+        await self._refresh_chips()
+
+    async def _refresh_chips(self) -> None:
+        chips = self.query_one("#f-tag-chips", Horizontal)
+        await chips.remove_children()
+        if self._chosen_tags:
+            await chips.mount_all(
+                Button(f"#{tag} ✕", id=f"chip-{index}", classes="tag-chip")
+                for index, tag in enumerate(self._chosen_tags)
+            )
+        else:
+            await chips.mount(Static("[dim]No tags chosen yet[/]", classes="tag-chip-empty"))
+
+    @on(Button.Pressed, "#f-tag-add")
+    async def _on_add_tag(self) -> None:
+        select = self.query_one("#f-tag-select", Select)
+        if select.value is Select.NULL:
+            return
+        tag = str(select.value)
+        if tag not in self._chosen_tags:
+            self._chosen_tags.append(tag)
+            await self._refresh_chips()
+        select.value = Select.NULL
+
+    @on(Button.Pressed, ".tag-chip")
+    async def _on_remove_chip(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if not button_id.startswith("chip-"):
+            return
+        del self._chosen_tags[int(button_id.removeprefix("chip-"))]
+        await self._refresh_chips()
 
     @on(Button.Pressed, "#form-add")
     def _on_add(self) -> None:
@@ -211,5 +293,6 @@ class HostFormDialog(_FormDialog):
                 description=description,
                 os=os_name,
                 status=Status.ONLINE,
+                tags=tuple(self._chosen_tags),
             )
         )

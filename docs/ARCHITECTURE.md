@@ -50,7 +50,7 @@ This is *why* the project is shaped the way it is:
 
 | Layer | What it is | What it's responsible for |
 | --- | --- | --- |
-| **Textual UI** (`app.py`, `dialogs.py`, `styles.tcss`) | A TUI app, one pane in the tmux window | Browsing the inventory, the Sessions/Logs tabs, add/delete forms, all rendering and input handling |
+| **Textual UI** (`app.py`, `dialogs.py`, `styles.tcss`) | A TUI app, one pane in the tmux window | Browsing the inventory, the Tags/Activity tabs, add/delete forms, all rendering and input handling |
 | **tmux** (`panes.py`) | The terminal multiplexer Jumpbox runs inside | Actually opening/stacking/closing the panes that host connections run in; per-login session isolation; mouse mode; color passthrough |
 | **OpenSSH** (`connect.py` + whatever `ssh` is already installed) | The actual network client | The real connection to the target host, and all authentication - Jumpbox never touches a credential |
 
@@ -86,9 +86,11 @@ JumpboxApp().run()                          (Textual's own event loop)
    ├─ on_mount():
    │    - detect the real pane/window/session ids via `tmux display-message`
    │    - turn mouse mode on for the session
-   │    - check for a forwarded SSH agent, notify either way
-   │    - load the inventory from disk (storage.load())
-   │    - populate the locations tree, Sessions tab, Logs tab
+   │    - check for a forwarded SSH agent (toast notifications are a
+   │      no-op app-wide - see App.notify() in app.py - so this is purely
+   │      informational for whatever calls self.notify() elsewhere)
+   │    - load the inventory + tag vocabulary from disk (storage.load())
+   │    - populate the locations tree, Tags tab, Activity tab
    │    - start the 1-second reconciliation timer
    │
    ├─ ... user drives the dashboard, opens/closes host panes ...
@@ -136,15 +138,15 @@ authentication side specifically.
   │                       │                        │                    │                        │ connection, tries
   │                       │◀────────── new pane id ───────────────────── │                        │ agent/keys, falls
   │                       │                        │                    │                        │ back to a password
-  │                       │ track OpenSession(pane_id, host, now)        │                        │ prompt if needed
-  │                       │ refresh Sessions tab    │                    │                        │
+  │                       │ track ActivityEntry(pane_id, host, ...)      │                        │ prompt if needed
+  │                       │ refresh Activity tab    │                    │                        │
   │◀── pane visible, ssh's output/prompt right there in it ─────────────┴────────────────────────┘
 ```
 
 The Python process is *out of the picture* the instant `open_pane()`
 returns - it never proxies the ssh session's input/output. tmux owns that
 pane directly; Jumpbox only tracks its id so it can detect when the pane
-goes away (see `_reconcile_sessions()` in `app.py`, and
+goes away (see `_reconcile_activity()` in `app.py`, and
 [TMUX_INTEGRATION.md](TMUX_INTEGRATION.md)).
 
 ## Module map
@@ -153,15 +155,16 @@ goes away (see `_reconcile_sessions()` in `app.py`, and
 jumpbox/
 ├── __main__.py    Entry point: ensure_in_tmux() → JumpboxApp().run() → kill_session()
 ├── app.py         The Textual App: widget tree, event handlers, the _connect()/
-│                  _reconcile_sessions() glue between the UI and panes.py
+│                  _reconcile_activity() glue between the UI and panes.py
 ├── panes.py       Every tmux interaction: bootstrap, session naming, pane
 │                  open/list, mouse mode, the truecolor fix
 ├── connect.py     Builds the one ssh command string for a host; checks
 │                  whether a forwarded agent is reachable. Never runs anything.
 ├── data.py        Location/Room/Host/Status dataclasses + the built-in demo seed
-├── storage.py     JSON persistence for the inventory (~/.jumpbox/inventory.json)
+├── storage.py     JSON persistence for the inventory + tag vocabulary
+│                  (~/.jumpbox/inventory.json)
 ├── dialogs.py     Modal screens: the "+" action menu, delete confirmation,
-│                  the three add-forms
+│                  the four add-forms (Location, Room, Host, Tag)
 ├── fuzzy.py       Dependency-free fuzzy matcher for the two search boxes
 └── styles.tcss    All Textual CSS - layout, the brand colour, the
                    per-location palette's room for tints, dialog chrome

@@ -31,25 +31,12 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
-from datetime import datetime
-
-from .data import Host
 
 SESSION_PREFIX = "jumpbox"
 
 
 class TmuxUnavailable(RuntimeError):
     """Raised when there's no tmux binary to drive."""
-
-
-@dataclass
-class OpenSession:
-    """One host currently connected in its own tmux pane."""
-
-    pane_id: str
-    host: Host
-    opened_at: datetime
 
 
 def session_name() -> str:

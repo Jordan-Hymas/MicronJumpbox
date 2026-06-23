@@ -16,10 +16,18 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
-from .data import Host, Location, Room, Status, load_inventory
+from .data import DEFAULT_TAGS, Host, Location, Room, Status, load_inventory
 
 INVENTORY_FILENAME = "inventory.json"
+
+
+class Inventory(NamedTuple):
+    """What `load()` returns: the locations tree plus the tag vocabulary."""
+
+    locations: list[Location]
+    tags: list[str]
 
 
 def data_dir() -> Path:
@@ -94,12 +102,27 @@ def _location_from_dict(data: dict) -> Location:
     )
 
 
-def save(locations: list[Location]) -> None:
+def _derive_tags(locations: list[Location]) -> list[str]:
+    """Fallback for files saved before the tag vocabulary existed: start
+    from the built-in defaults, plus whatever tags hosts already carry, so
+    upgrading never makes an in-use tag vanish from the Tags tab."""
+    used = {
+        tag
+        for location in locations
+        for room in location.rooms
+        for host in room.hosts
+        for tag in host.tags
+    }
+    return sorted(set(DEFAULT_TAGS) | used)
+
+
+def save(locations: list[Location], tags: list[str] = ()) -> None:
     """Write the inventory to disk. Atomic: a crash mid-write can't corrupt it."""
     path = inventory_path()
     payload = {
         "version": 1,
         "saved_at": datetime.now(timezone.utc).isoformat(),
+        "tags": sorted(set(tags)),
         "locations": [_location_to_dict(loc) for loc in locations],
     }
     tmp_path = path.with_name(path.name + ".tmp")
@@ -107,7 +130,7 @@ def save(locations: list[Location]) -> None:
     os.replace(tmp_path, path)
 
 
-def load() -> list[Location]:
+def load() -> Inventory:
     """Load the inventory from disk, seeding it from the demo data on first run.
 
     A corrupt file is renamed aside (never silently discarded) rather than
@@ -116,15 +139,20 @@ def load() -> list[Location]:
     path = inventory_path()
     if not path.exists():
         locations = load_inventory()
-        save(locations)
-        return locations
+        tags = sorted(DEFAULT_TAGS)
+        save(locations, tags)
+        return Inventory(locations, tags)
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        return [_location_from_dict(loc) for loc in payload["locations"]]
+        locations = [_location_from_dict(loc) for loc in payload["locations"]]
+        raw_tags = payload.get("tags")
+        tags = sorted(set(raw_tags)) if raw_tags is not None else _derive_tags(locations)
+        return Inventory(locations, tags)
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         backup = path.with_name(f"{path.name}.bad-{datetime.now():%Y%m%d%H%M%S}")
         path.replace(backup)
         locations = load_inventory()
-        save(locations)
-        return locations
+        tags = sorted(DEFAULT_TAGS)
+        save(locations, tags)
+        return Inventory(locations, tags)
