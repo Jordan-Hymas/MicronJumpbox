@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -21,6 +23,14 @@ from typing import NamedTuple
 from .data import DEFAULT_TAGS, Host, Location, Room, Status, load_inventory
 
 INVENTORY_FILENAME = "inventory.json"
+HISTORY_FILENAME = "history.json"
+CONFIG_FILENAME = "config.json"
+
+# How many previous copies of inventory.json survive as inventory.json.1
+# (newest) .. .5 (oldest). Every save rotates, so one bad bulk operation -
+# or a fat-fingered delete-location - is always undoable by copying a
+# numbered backup back over the file and hitting F5.
+BACKUP_COUNT = 5
 
 
 class Inventory(NamedTuple):
@@ -28,6 +38,30 @@ class Inventory(NamedTuple):
 
     locations: list[Location]
     tags: list[str]
+
+
+@dataclass(frozen=True)
+class Config:
+    """Site-wide defaults, read from ~/.jumpbox/config.json (created with
+    these defaults on first run so it's discoverable). Every field is
+    optional in the file - anything missing keeps its default here.
+
+    - default_username/default_port/default_os prefill the Add Host form,
+      and fill CSV import columns left blank.
+    - probe_interval: seconds between live reachability sweeps of every
+      host's ssh port (the status dots). 0 turns probing off entirely.
+    - probe_timeout: seconds before an unanswered probe counts as OFFLINE.
+    - ssh_options: extra ssh arguments applied to *every* connection, e.g.
+      ["-o", "ConnectTimeout=5"] - per-host ssh_args come on top of these.
+      Same forbidden-option screening as per-host args (see connect.py).
+    """
+
+    default_username: str = ""
+    default_port: int = 22
+    default_os: str = "Linux"
+    probe_interval: float = 30.0
+    probe_timeout: float = 1.5
+    ssh_options: tuple[str, ...] = ()
 
 
 def data_dir() -> Path:
@@ -52,6 +86,7 @@ def _host_to_dict(host: Host) -> dict:
         "os": host.os,
         "status": host.status.value,
         "tags": list(host.tags),
+        "ssh_args": list(host.ssh_args),
     }
 
 
@@ -65,6 +100,7 @@ def _host_from_dict(data: dict) -> Host:
         os=data.get("os", "Linux"),
         status=Status(data.get("status", "online")),
         tags=tuple(data.get("tags", [])),
+        ssh_args=tuple(data.get("ssh_args", [])),
     )
 
 
@@ -116,8 +152,30 @@ def _derive_tags(locations: list[Location]) -> list[str]:
     return sorted(set(DEFAULT_TAGS) | used)
 
 
+def _rotate_backups(path: Path) -> None:
+    """Keep the last BACKUP_COUNT saved states as `<name>.1` (newest) ..
+    `<name>.N` (oldest). The live file is *copied* aside, never moved, so
+    a crash anywhere in here still leaves `inventory.json` itself intact."""
+    if not path.exists():
+        return
+    for index in range(BACKUP_COUNT - 1, 0, -1):
+        older = path.with_name(f"{path.name}.{index}")
+        if older.exists():
+            os.replace(older, path.with_name(f"{path.name}.{index + 1}"))
+    shutil.copy2(path, path.with_name(f"{path.name}.1"))
+
+
+def _write_json(path: Path, payload: object) -> None:
+    """Atomic JSON write: a crash mid-write can't corrupt the target file."""
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def save(locations: list[Location], tags: list[str] = ()) -> None:
-    """Write the inventory to disk. Atomic: a crash mid-write can't corrupt it."""
+    """Write the inventory to disk, rotating the previous state into the
+    numbered backups first - so any save (a UI edit, a bulk import) can be
+    undone by copying `inventory.json.1` back over `inventory.json`."""
     path = inventory_path()
     payload = {
         "version": 1,
@@ -125,9 +183,8 @@ def save(locations: list[Location], tags: list[str] = ()) -> None:
         "tags": sorted(set(tags)),
         "locations": [_location_to_dict(loc) for loc in locations],
     }
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
+    _rotate_backups(path)
+    _write_json(path, payload)
 
 
 def load() -> Inventory:
@@ -156,3 +213,80 @@ def load() -> Inventory:
         tags = sorted(DEFAULT_TAGS)
         save(locations, tags)
         return Inventory(locations, tags)
+
+
+# --------------------------------------------------------------- history
+def history_path() -> Path:
+    return data_dir() / HISTORY_FILENAME
+
+
+def load_history() -> dict[str, dict]:
+    """Per-host connection history: host name -> {"last_connected": ISO
+    timestamp, "count": int}. Unlike the inventory, this is disposable
+    convenience data - a missing or unreadable file just means an empty
+    history, no backup dance."""
+    path = history_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def record_connection(host_name: str) -> dict[str, dict]:
+    """Bump `host_name`'s history entry (now + count) and persist it;
+    returns the updated history so the app can keep using it in memory."""
+    history = load_history()
+    entry = history.get(host_name) or {}
+    history[host_name] = {
+        "last_connected": datetime.now(timezone.utc).isoformat(),
+        "count": int(entry.get("count", 0)) + 1,
+    }
+    _write_json(history_path(), history)
+    return history
+
+
+# ---------------------------------------------------------------- config
+def config_path() -> Path:
+    return data_dir() / CONFIG_FILENAME
+
+
+def load_config() -> Config:
+    """Read ~/.jumpbox/config.json, writing one out with the defaults on
+    first run so the knobs are discoverable. Missing keys keep their
+    defaults; an unparseable file just means all-defaults (it's left in
+    place untouched for the user to fix, never renamed aside - unlike the
+    inventory, nothing is lost by ignoring it)."""
+    path = config_path()
+    defaults = Config()
+    if not path.exists():
+        _write_json(
+            path,
+            {
+                "default_username": defaults.default_username,
+                "default_port": defaults.default_port,
+                "default_os": defaults.default_os,
+                "probe_interval": defaults.probe_interval,
+                "probe_timeout": defaults.probe_timeout,
+                "ssh_options": list(defaults.ssh_options),
+            },
+        )
+        return defaults
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return defaults
+        return Config(
+            default_username=str(payload.get("default_username", defaults.default_username)),
+            default_port=int(payload.get("default_port", defaults.default_port)),
+            default_os=str(payload.get("default_os", defaults.default_os)),
+            probe_interval=float(payload.get("probe_interval", defaults.probe_interval)),
+            probe_timeout=float(payload.get("probe_timeout", defaults.probe_timeout)),
+            ssh_options=tuple(
+                str(opt) for opt in payload.get("ssh_options", [])
+            ),
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, OSError):
+        return defaults

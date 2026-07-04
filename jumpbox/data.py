@@ -38,6 +38,10 @@ class Host:
     os: str = "Linux"
     status: Status = Status.ONLINE
     tags: tuple[str, ...] = field(default_factory=tuple)
+    # Extra ssh arguments for this one host - old network gear often needs
+    # legacy crypto re-enabled, e.g. ("-o", "KexAlgorithms=+diffie-hellman-group14-sha1").
+    # connect.py quotes each one and refuses locally-executing options.
+    ssh_args: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def target(self) -> str:
