@@ -37,18 +37,23 @@ to low hundreds of hosts" - see [DATA_MODEL.md](DATA_MODEL.md) - so no
 redesign is needed for scale. What doesn't scale is hand-adding hundreds
 of hosts one at a time through the Add Host dialog.
 
-Plan: write a one-off **bulk-import script** that reads from whatever
-source of truth the real host list comes from (CSV/spreadsheet export from
-a CMDB/IPAM/NetBox, or just a hand-built spreadsheet) and calls
-`storage.save()` once with the fully-built `Location`/`Room`/`Host` tree.
-The UI stays the day-to-day editing tool after that, not the initial
-population method.
+Plan: ~~write a one-off bulk-import script~~ **Done - built into the CLI**
+(`bulk.py`, 2026-07-04). `jumpbox template hosts.csv` writes a starter CSV
+showing every column; `jumpbox import hosts.csv --dry-run` reports what
+would change without writing; `jumpbox import hosts.csv --replace` does
+the initial clean-slate population. Re-imports *merge* (matched by host
+name: fields refresh in place, moved hosts move, nothing duplicates), so
+periodic re-syncs from the source of truth are the same command. Bad rows
+are skipped and reported with line numbers, never aborting the rest, and
+every import keeps the previous inventory as a rotated backup
+(`inventory.json.1`). The UI stays the day-to-day editing tool after
+initial population, with `jumpbox export` → edit → `import` for bulk
+edits.
 
-Status: **blocked on receiving the real host list.** Once it's available
-(CSV or whatever format it's actually in), write the import script against
-its real columns - the buildings/rooms/tag vocabulary already in `data.py`
-are a reasonable starting template to map onto, but should be replaced
-with the real site list rather than assumed.
+Status: **the tooling is ready; still blocked on receiving the real host
+list.** Once it arrives in whatever format it's actually in, export it to
+CSV, rename its columns to match the template's header, and run the
+dry-run to shake out validation issues before the real import.
 
 ## 3. SSH credentials when devices are normally accessed via SSO
 

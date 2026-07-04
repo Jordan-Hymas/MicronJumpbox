@@ -26,6 +26,7 @@ class Host:
     os: str = "Linux"
     status: Status = Status.ONLINE
     tags: tuple[str, ...] = ()
+    ssh_args: tuple[str, ...] = ()  # per-host extra ssh options (legacy KEX etc.)
 
     @property
     def target(self) -> str:        # "user@host" form for the ssh command line
@@ -51,12 +52,18 @@ editing an existing one's fields. The lists themselves (`rooms`, `hosts`)
 are regular mutable lists, so structural changes (add/delete) are plain
 list operations; the leaf objects are immutable values.
 
-`Status` exists purely for the colored dot/label in the UI
+`Status` drives the colored dot/label in the UI
 (`#50fa7b`/`#f1fa8c`/`#ff5555` for online/degraded/offline in `app.py`'s
-`STATUS_COLOR`) - it isn't a live health check. Nothing in Jumpbox pings a
-host to determine its status; you set it when adding the host (the Add
-Host form always creates new hosts as `ONLINE` - there's no UI to change
-status after the fact, only to delete and re-add).
+`STATUS_COLOR`) and is **live**: a background sweep (`_probe_all_hosts()`
+in `app.py`, using `connect.probe()`) TCP-probes every host's ssh port
+from this box every `probe_interval` seconds (config.json, default 30; 0
+disables). Port accepts = `ONLINE`, host answers but refuses the port =
+`DEGRADED`, no answer within `probe_timeout` = `OFFLINE`. A sweep only
+updates statuses in memory (replacing the frozen `Host` values) and
+repaints what changed - it never writes the inventory file by itself. The
+Add/Edit Host form also has a manual status picker, but a probe sweep
+will overwrite that with reality on its next pass (turn probing off in
+config.json if hand-set statuses should stick).
 
 `online` / `total_hosts` on `Room`/`Location` are computed properties
 (`sum(1 for h in self.hosts if h.status is Status.ONLINE)`, etc.) - they're
@@ -131,11 +138,16 @@ Key behaviors, all in `storage.py`:
   gear - switches, APs, routers, firewalls - one per `Status`/`Host` field)
   and writes it out immediately. From then on the file is authoritative -
   the demo seed is only ever used again if the file goes missing entirely.
-- **Every add/delete** calls `_save()` (`app.py`), which writes the
+- **Every add/edit/delete** calls `_save()` (`app.py`), which writes the
   **entire** inventory back out, not a diff. `save()` writes to a
   `.tmp` sibling file first and `os.replace()`s it into place - that
   rename is atomic at the filesystem level, so a crash mid-write can
   never leave a half-written, corrupt `inventory.json`.
+- **Every save also rotates backups first**: the previous state is copied
+  to `inventory.json.1`, what was `.1` shifts to `.2`, and so on up to
+  `.5` (`BACKUP_COUNT`). The live file is copied, never moved, so a crash
+  mid-rotation still leaves `inventory.json` intact. Undo = copy a
+  numbered backup back over the file and hit F5.
 - **A corrupted file** (hand-edited badly, truncated, whatever) is caught
   by a broad `except (json.JSONDecodeError, KeyError, TypeError, ValueError)`
   around the parse. Instead of silently discarding it, `load()` renames it
@@ -159,6 +171,34 @@ Key behaviors, all in `storage.py`:
   never touches a real user's saved inventory) but works the same way for
   a real deployment if you want the data file somewhere other than the
   Jumpbox user's home directory.
+
+Two more files live next to `inventory.json`, both also in `storage.py`:
+
+- **`config.json`** - site-wide defaults, written out with its default
+  values on first run so the knobs are discoverable:
+  `default_username`/`default_port`/`default_os` (prefill the Add Host
+  form; fill blank CSV import cells), `probe_interval`/`probe_timeout`
+  (the live status sweeps; 0 disables), and `ssh_options` (extra ssh
+  arguments applied to every connection, before any per-host `ssh_args`).
+  Missing keys keep their defaults; an unparseable file means
+  all-defaults and is left in place for the user to fix.
+- **`history.json`** - per-host connection history (`host name →
+  {last_connected, count}`), updated by `record_connection()` every time
+  a pane opens. Shown in the detail panel and the Quick Connect palette.
+  Deliberately disposable: unreadable/missing just means empty history.
+
+## Bulk import/export (`bulk.py`)
+
+`jumpbox import/export/template` (see the README for the workflow) lives
+in `bulk.py`, deliberately UI-free. `import_csv()` never mutates its
+inputs and never writes to disk - it returns a *new* `(locations, tags,
+report)` and the CLI decides whether to `storage.save()` it, which is
+exactly what `--dry-run` doesn't do. Merging matches hosts by name
+(case-insensitive) across the whole inventory; per-row failures (bad
+port/status, missing required cells, duplicate names, forbidden
+ssh options) are skipped and reported with line numbers, never fatal.
+`export_csv()` ↔ `import --replace` is a lossless round trip (location
+and room descriptions ride along as their own columns for that reason).
 
 ### Per-machine, not shared
 

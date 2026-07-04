@@ -27,21 +27,28 @@ Either way you type **`jumpbox`** once the venv is active.
 | ↑ / ↓               | Move through the list                 |
 | Enter / double-click| Open the highlighted host in a new pane |
 | **F2**              | Open the highlighted host in a new pane |
-| **/**               | Jump to the host search box           |
+| **Ctrl+F**          | Quick Connect: search every host everywhere, Enter connects |
+| **F4** / ⛶ button   | Fullscreen the newest open host pane (Ctrl+B then Z to come back) |
+| **/**               | Jump to the host search box (current room) |
 | **Ctrl+R**          | Jump to the room search box           |
-| **F5**              | Refresh inventory                     |
+| **F5**              | Refresh inventory (also re-reads config + reprobes) |
 | **Ctrl+Q**          | Quit (closes every open host pane too) |
+
+The **+** menus next to the search boxes add, **edit**, and delete
+locations, rooms, and hosts - editing opens the same form prefilled, so
+fixing a typo'd IP is Edit → change → Save, not delete-and-re-add.
 
 ## Project layout
 
 ```
 MicronJumpbox/
 ├─ jumpbox/
-│  ├─ app.py        # Textual UI (locations tree, hosts list, dialogs)
+│  ├─ app.py        # Textual UI (locations tree, hosts list, quick connect, probes)
 │  ├─ data.py       # Location/Room/Host model + the built-in demo seed
-│  ├─ storage.py    # Reads/writes the persisted inventory (see below)
-│  ├─ dialogs.py    # Add/delete modals
-│  ├─ connect.py    # Builds the ssh command run in each new pane
+│  ├─ storage.py    # Persisted inventory + backups, config.json, history.json
+│  ├─ bulk.py       # CSV import/export/template (the `jumpbox import` CLI)
+│  ├─ dialogs.py    # Add/edit/delete modals
+│  ├─ connect.py    # Builds the ssh command run in each new pane + status probe
 │  ├─ panes.py      # tmux session/pane management - the actual "connect"
 │  ├─ fuzzy.py      # Dependency-free fuzzy matcher
 │  └─ styles.tcss   # All the styling
@@ -54,7 +61,7 @@ MicronJumpbox/
 
 ## Data & persistence
 
-Every location/room/host you add or delete, and the Tags tab's tag
+Every location/room/host you add, edit, or delete, and the Tags tab's tag
 vocabulary, is written to a JSON file at `~/.jumpbox/inventory.json` on
 whichever machine the app is running on.
 
@@ -63,15 +70,69 @@ whichever machine the app is running on.
   switches, APs, routers, firewalls), then writes it out. From then on, the
   file is the source of truth — `data.py`'s demo set is only ever used
   again if the file goes missing.
-- **Every add/delete** writes the full inventory back to disk immediately
-  (atomically — a crash mid-write can't corrupt it).
+- **Every add/edit/delete** writes the full inventory back to disk
+  immediately (atomically — a crash mid-write can't corrupt it), and
+  first **rotates the previous state** into `inventory.json.1` (newest)
+  through `.5` (oldest). Any mistake — a fat-fingered delete, a bad bulk
+  import — is undoable: copy a numbered backup back over
+  `inventory.json` and hit F5.
 - **F5 / Refresh** re-reads the file from disk (handy if it was edited by
   hand or by another process), it does **not** reset you back to the demo data.
 - **A corrupted file** is renamed aside as `inventory.json.bad-<timestamp>`
   instead of being silently overwritten, and the app falls back to a fresh
   demo seed so a bad edit can't make Jumpbox unusable.
+- **`~/.jumpbox/config.json`** (written with defaults on first run) holds
+  site-wide knobs: `default_username`/`default_port`/`default_os` prefill
+  the Add Host form and fill blank CSV import columns; `probe_interval` /
+  `probe_timeout` control the live status sweeps below (0 turns them
+  off); `ssh_options` is a list of extra ssh arguments applied to every
+  connection (per-host options come on top).
+- **`~/.jumpbox/history.json`** remembers when each host was last
+  connected to (and how many times) across runs — shown in the detail
+  panel and the Quick Connect palette.
 - Override the storage location (mainly for tests) with the `JUMPBOX_DATA_DIR`
   environment variable.
+
+## Bulk import/export (CSV)
+
+Hand-adding hundreds of hosts through the form doesn't scale, so the real
+inventory loads from a CSV — whatever the actual source of truth is
+(CMDB/IPAM/NetBox export, spreadsheet), it can always be exported to CSV:
+
+```bash
+jumpbox template hosts.csv          # starter CSV showing every column
+jumpbox import hosts.csv --dry-run  # report what would change, write nothing
+jumpbox import hosts.csv            # merge into the existing inventory
+jumpbox import hosts.csv --replace  # wipe and rebuild from the CSV alone
+jumpbox export hosts.csv            # dump the inventory back out
+```
+
+`location, room, name, address` are required per row; username/port/OS
+fall back to `config.json`'s defaults; `tags` (space- or `;`-separated),
+`status`, `description`, `ssh_args`, and `icon` are optional. Merging
+matches hosts **by name** across the whole inventory: re-importing an
+updated export refreshes fields in place (blank cells keep existing
+values) and moves hosts whose location/room changed — it never
+duplicates. Bad rows are skipped and reported with line number and
+reason; they never abort the rest. Export → edit in a spreadsheet →
+re-import is also the bulk-*editing* workflow, and `export` →
+`import --replace` is a lossless round trip.
+
+## Live status + per-host SSH options
+
+- The status dots are **live**: a background sweep TCP-probes every
+  host's ssh port from this box every `probe_interval` seconds (default
+  30) — port open = `ONLINE` (green), host up but port refused =
+  `DEGRADED` (yellow), no answer = `OFFLINE` (red). Nothing is sent on
+  the probe connection, and a sweep never writes the inventory file.
+- A host can carry **extra ssh arguments** (`ssh_args` — set in the
+  Add/Edit Host form or the CSV), for things like old network gear
+  needing legacy key exchange:
+  `-o KexAlgorithms=+diffie-hellman-group14-sha1`. Options that would
+  make ssh run a *local* command (`ProxyCommand`, `LocalCommand`) are
+  refused at entry and stripped defensively at connect time — on a shared
+  box, one person's host entry runs in another person's pane, and it must
+  never be able to execute anything there.
 
 > **Per-machine, not shared.** This is one file per machine Jumpbox runs on. If
 > everyone SSHes into one shared jump server and runs Jumpbox there (see
@@ -103,6 +164,14 @@ ssh -p <port> <user>@<target>
   focuses it and sends your typing there, same as clicking between windows
   in any other app. (Holding Shift while dragging still gets you the
   terminal's native text selection, for copying something out of a pane.)
+- **Fullscreen a host** with the **⛶ Fullscreen** button (next to
+  Connect, or on the Activity tab for the selected connection) or **F4** -
+  it zooms the most recent open host pane over the whole window using
+  tmux's zoom, so the split underneath is untouched. Come back with
+  **Ctrl+B then Z** (tmux's zoom toggle), or just end the session (`exit`)
+  - tmux unzooms automatically when the zoomed pane closes and you land
+  right back on the dashboard. The ⛶ buttons are only enabled while a
+  connection is open.
 - **Ending a connection** is deliberately just typing `exit` inside its
   pane (or letting the connection drop) - there's no Close button anywhere.
   tmux closes that pane immediately and reflows the rest straight back: 3
@@ -258,7 +327,8 @@ To regenerate the UI preview screenshot:
 - Pane sizing currently just halves whatever's left each time a host is
   added (so the column isn't perfectly even past 2-3 hosts) - revisit with
   `select-layout` if that turns out to matter in practice.
-- Going from this demo inventory to the real one: see
-  [docs/DEPLOYMENT_PLAN.md](docs/DEPLOYMENT_PLAN.md) for network
-  reachability, bulk-importing the real host list, and how SSH
-  credentials should work once SSO is involved.
+- Going from this demo inventory to the real one: the bulk-import tooling
+  is ready (`jumpbox template` / `import` / `export` above) - what's left
+  is the real host list to feed it, network reachability from the VM, and
+  confirming the SSO/credential pattern. See
+  [docs/DEPLOYMENT_PLAN.md](docs/DEPLOYMENT_PLAN.md).

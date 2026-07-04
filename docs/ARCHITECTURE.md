@@ -37,9 +37,8 @@ This is *why* the project is shaped the way it is:
   has to originate from the bastion**, not from your machine.
 - Since Jumpbox already runs on the bastion, the most direct way to "open
   a host" is to run `ssh` *right there* - no second jump, no relay back out
-  to your machine and in again. See [SSH_AUTHENTICATION.md](SSH_AUTHENTICATION.md)
-  for why an earlier version of this code did jump unnecessarily, and why
-  that was a bug.
+  to your machine and in again (an earlier version of this code did jump
+  unnecessarily; `connect.py`'s docstring covers why that was a bug).
 - Because everything happens on one machine, the "new window" you get when
   you click a host can't be a new MobaXterm window (Jumpbox has no way to
   reach back out to your desktop) - it's a new **tmux pane**, which is a
@@ -58,9 +57,8 @@ None of these layers know much about the others beyond a narrow interface:
 the UI layer calls into `panes.py` with a command string and a target pane
 id and gets back a new pane id; `connect.py` only ever produces a string,
 it never runs anything itself. That separation is deliberate - it's what
-let the "new tab" mechanism get replaced twice during development (see
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md)) without touching the UI or the
-SSH command construction at all.
+let the "new tab" mechanism get replaced twice during development without
+touching the UI or the SSH command construction at all.
 
 ## Process lifecycle
 
@@ -114,8 +112,8 @@ just done from Python via `os.execvp` instead of from a shell profile.
 ## Sequence: clicking a host
 
 This is the part that matters most for understanding "why is/isn't this
-passwordless" - see [SSH_AUTHENTICATION.md](SSH_AUTHENTICATION.md) for the
-authentication side specifically.
+passwordless" - see the top-level README's "Passwordless access" section
+(and `connect.py`'s docstring) for the authentication side specifically.
 
 ```
  You                  app.py (Textual)         panes.py               tmux              ssh (in the new pane)

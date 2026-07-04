@@ -212,9 +212,9 @@ because you typed `exit`, the connection dropped, or anything else. tmux
 then reflows the remaining panes in that branch to fill the freed space
 automatically - verified directly: 3 panes open, kill the middle one, the
 other two expand to fill its space, no extra code needed on Jumpbox's side
-at all. This used to not be true (see
-[TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the `remain-on-exit` detour
-and why it was removed) - now a pane closing *is* the close action.
+at all. This used to not be true (an early version took a `remain-on-exit`
+detour that left dead panes on screen; it was removed) - now a pane
+closing *is* the close action.
 
 ### Noticing a pane is gone: reconciliation
 
@@ -274,8 +274,8 @@ created (refreshed for a documented default set of variables - including
 before `ensure_in_tmux()` runs, split a brand new pane afterward, and
 `env | grep SSH_AUTH_SOCK` *inside that new pane* shows the same value.
 This is the entire reason a forwarded SSH agent "just works" in every host
-pane with zero code in Jumpbox dedicated to it - see
-[SSH_AUTHENTICATION.md](SSH_AUTHENTICATION.md).
+pane with zero code in Jumpbox dedicated to it - see the top-level
+README's "Passwordless access" section.
 
 ## Teardown
 

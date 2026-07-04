@@ -11,25 +11,23 @@ Read them in this order if you're new to the codebase:
    (Textual UI, tmux, OpenSSH) on one process model, and exactly how a
    click on a host turns into a real terminal session. Start here.
 2. **[DATA_MODEL.md](DATA_MODEL.md)** - the Location → Room → Host hierarchy,
-   how it's held in memory, and how it's persisted to disk as JSON.
-3. **[UI_GUIDE.md](UI_GUIDE.md)** - the Textual layer: the widget tree, the
-   modal dialogs, the styling/theming system, the per-location colour palette.
-4. **[TMUX_INTEGRATION.md](TMUX_INTEGRATION.md)** - the part that makes
+   how it's held in memory, how it's persisted to disk as JSON (plus the
+   rotating backups, config.json, history.json), and the bulk CSV
+   import/export.
+3. **[TMUX_INTEGRATION.md](TMUX_INTEGRATION.md)** - the part that makes
    "connect" actually open something: session bootstrap, per-login
    isolation, pane splitting/stacking, mouse mode, truecolor passthrough,
    and how a session ever gets cleaned up.
-5. **[SSH_AUTHENTICATION.md](SSH_AUTHENTICATION.md)** - what actually runs
-   when you connect, and how key-based, no-password access works (or
-   doesn't, and why).
-6. **[MOBAXTERM_SETUP.md](MOBAXTERM_SETUP.md)** - **give this one to anyone
-   you hand the program to.** The actual click-by-click MobaXterm settings
-   needed to get in without typing a password.
-7. **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - symptom → cause → fix, for
-   the specific bugs that came up building this and how they were diagnosed.
-8. **[DEPLOYMENT_PLAN.md](DEPLOYMENT_PLAN.md)** - the open items for going
+4. **[DEPLOYMENT_PLAN.md](DEPLOYMENT_PLAN.md)** - the open items for going
    from a dev machine to the real jump-host VM: network reachability to
    the actual switches/APs/routers/firewalls, bulk-loading the real host
-   list, and how SSH credentials should work once SSO is in the picture.
+   list (the tooling for which now exists - `jumpbox import`), and how
+   SSH credentials should work once SSO is in the picture.
+
+SSH authentication (how passwordless access works, and the MobaXterm
+agent-forwarding setup to hand to new users) is covered in the top-level
+[README](../README.md)'s "Passwordless access" section and in
+`connect.py`'s module docstring.
 
 ## The one-paragraph version
 
