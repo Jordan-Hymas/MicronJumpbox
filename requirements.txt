@@ -1,4 +1,27 @@
-# Jumpbox runtime dependencies (pinned for reproducible deploys).
-# Install with:  pip install -r requirements.txt
-textual==8.2.7
-rich==15.0.0
+# Jumpbox runtime dependencies - pinned so every deploy (dev machine, the
+# jump-host VM) installs exactly the same, known-good versions.
+#
+# Install with:   bash setup.sh          (preferred - does everything)
+#         or:     pip install -r requirements.txt
+#
+# pip resolves each package's own dependencies (markdown-it-py,
+# typing-extensions, etc.) automatically, online or from a ./wheels
+# folder. For a VM with no PyPI access, prefill that folder on any
+# machine WITH internet (same Python major.minor as the VM):
+#
+#   python3 -m pip download -r requirements.txt -d wheels
+#
+# then copy the project over including wheels/ - setup.sh detects it and
+# installs fully offline. See the header of setup.sh for everything else
+# the VM needs (Python 3.10+, tmux, ssh).
+
+textual==8.2.7      # the TUI framework: widgets, CSS layout, event loop
+rich==15.0.0        # terminal rendering underneath Textual (colors, markup)
+
+# Build backend for installing Jumpbox itself. setup.sh runs
+# `pip install . --no-build-isolation`, which builds with THIS setuptools
+# from the venv instead of silently downloading one from PyPI mid-install
+# - that hidden download is exactly what would break an offline install
+# on the VM. (Python 3.12+ venvs no longer bundle setuptools.)
+setuptools==83.0.0
+wheel==0.45.1       # used by setuptools to build the install artifact

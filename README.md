@@ -293,6 +293,14 @@ bash setup.sh   # creates .venv, installs deps
 bash run.sh     # starts Jumpbox
 ```
 
+The header of `setup.sh` documents exactly what the server needs (the
+short version: Python **3.10+** with the venv module, `tmux`, `ssh`, and
+either PyPI access or a prefilled `wheels/` folder for a fully **offline
+install** - `python3 -m pip download -r requirements.txt -d wheels` on
+any machine with internet, then copy the folder over; `setup.sh` detects
+it automatically). Re-run `setup.sh` after updating the code - it
+installs a snapshot, not a live link to the source.
+
 **Verify before poking around the UI:**
 
 ```bash
