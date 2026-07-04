@@ -24,6 +24,7 @@ Run from the project root:  python -m tests.smoke
 """
 
 import asyncio
+import json
 import os
 import shlex
 import shutil
@@ -34,6 +35,15 @@ from pathlib import Path
 
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="jumpbox-smoke-")
 os.environ["JUMPBOX_DATA_DIR"] = _TEST_DATA_DIR
+
+# Live-status probing is exercised on its own further down, against real
+# local sockets (see the connect.probe section). Inside the UI run it's
+# turned off via config.json: the demo inventory's 10.x addresses aren't
+# reachable here, and a background sweep rebuilding the tree mid-test
+# would race assertions that hold references to tree nodes.
+Path(_TEST_DATA_DIR, "config.json").write_text(
+    json.dumps({"probe_interval": 0}), encoding="utf-8"
+)
 
 from textual.widgets import Button, Input, Select, TabbedContent, Tree
 
@@ -66,6 +76,7 @@ async def main() -> None:
     # whole test, same as in the real app) never touches actual tmux.
     opened: list[tuple[str, str, bool]] = []
     live_panes: set[str] = set()
+    zoomed: list[str] = []
 
     def fake_open_pane(target_pane: str, command: str, *, stacked: bool) -> str:
         pane_id = f"%{len(opened) + 1}"
@@ -75,6 +86,7 @@ async def main() -> None:
 
     appmod.panes.open_pane = fake_open_pane
     appmod.panes.live_pane_ids = lambda window_id: set(live_panes)
+    appmod.panes.zoom_pane = lambda pane_id: zoomed.append(pane_id)
 
     app = JumpboxApp()
     async with app.run_test(size=(120, 45)) as pilot:
@@ -172,6 +184,15 @@ async def main() -> None:
         assert not opened, "no tmux session means there's nowhere to open a pane"
         assert not app.activity, "a refused connect must not be logged"
 
+        # Nothing is connected yet, so there's nothing to fullscreen - the
+        # ⛶ buttons must be disabled and F4 must be a safe no-op.
+        assert app.query_one("#fullscreen", Button).disabled, (
+            "the Dashboard ⛶ button must start disabled"
+        )
+        assert app.query_one("#fullscreen-activity", Button).disabled
+        app.action_fullscreen()
+        assert not zoomed, "fullscreen with nothing open must not zoom anything"
+
         # Fake having a real tmux session, the same way on_mount would set
         # it up after a successful real detection.
         app.tmux_session = "fake-session"
@@ -190,6 +211,18 @@ async def main() -> None:
         assert app.activity[0].pane_id == "%1"
         assert app.activity[0].is_open, "a fresh connection should start open"
 
+        # Connecting must persist per-host history (last connected / count) -
+        # it survives restarts (history.json) and shows in the detail panel.
+        assert app.history.get(target_host.name, {}).get("count", 0) == 1, (
+            "a connect should record the host into the persisted history"
+        )
+        assert storage.load_history().get(target_host.name), (
+            "history must round-trip through history.json, not just memory"
+        )
+        assert "last connected" in str(app.query_one("#detail-body").render()), (
+            "the detail panel should show when this host was last connected"
+        )
+
         # A second host must stack *below the first host pane*, not split
         # off Jumpbox's pane again.
         other_target = host_items[0]
@@ -202,6 +235,19 @@ async def main() -> None:
         assert second_stacked is True, "every host after the first must stack below the last"
         assert len(app.activity) == 2
         assert app.activity[0].host is other_host, "activity is newest first"
+
+        # ⛶ Fullscreen: enabled now that connections are open, and F4 (or
+        # the button) zooms the tmux pane of the *most recent* open one.
+        assert not app.query_one("#fullscreen", Button).disabled, (
+            "the ⛶ button must enable once a connection is open"
+        )
+        app.action_fullscreen()
+        assert zoomed == ["%2"], (
+            f"fullscreen should zoom the most recently opened pane, got {zoomed}"
+        )
+        app.query_one("#fullscreen", Button).press()
+        await pilot.pause()
+        assert zoomed == ["%2", "%2"], "the Dashboard ⛶ button does the same as F4"
 
         # --- Tags tab: browse/filter hosts by tag across the *whole*
         # inventory, not just whatever room is selected on the Dashboard ---
@@ -272,6 +318,10 @@ async def main() -> None:
         assert len(app.activity) == 3, "closed entries remain as history"
         rendered = [str(item.query_one("Static").render()) for item in app.query(ActivityItem)]
         assert not any("OPEN" in r for r in rendered)
+        assert app.query_one("#fullscreen", Button).disabled, (
+            "the ⛶ buttons must disable again once every connection closes"
+        )
+        assert app.query_one("#fullscreen-activity", Button).disabled
         stamp = app.activity[0].opened_at.strftime("%Y-%m-%d %I:%M:%S %p")
         assert stamp in rendered[0]
 
@@ -423,6 +473,76 @@ async def main() -> None:
         app.query_one(TabbedContent).active = "dashboard"
         await pilot.pause()
 
+        # --- edit host: the form opens prefilled, Save replaces in place -
+        # no more delete-and-re-add to fix a typo'd IP ---------------------
+        edit_room = app._current_room
+        host_to_edit = app._highlighted_host()
+        assert host_to_edit is not None
+        app.run_worker(app._edit_host())
+        await _wait_until(pilot, _modal_open)
+        assert app.screen.query_one("#f-name", Input).value == host_to_edit.name, (
+            "the edit form must open prefilled with the host's current values"
+        )
+        app.screen.query_one("#f-address", Input).value = "10.99.9.9"
+        app.screen.query_one("#f-ssh-args", Input).value = (
+            "-o KexAlgorithms=+diffie-hellman-group14-sha1"
+        )
+        app.screen.query_one("#form-add", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        edited = next(h for h in edit_room.hosts if h.name == host_to_edit.name)
+        assert edited.address == "10.99.9.9", "Save must apply the new address"
+        assert edited.ssh_args == ("-o", "KexAlgorithms=+diffie-hellman-group14-sha1"), (
+            "Save must apply the parsed ssh options"
+        )
+        assert edited.username == host_to_edit.username, (
+            "fields left alone must survive the edit unchanged"
+        )
+        edited_command = connect_command(edited)
+        assert "KexAlgorithms" in edited_command and edited_command.endswith(
+            shlex.quote(edited.target)
+        ), f"ssh_args should be woven into the command: {edited_command!r}"
+
+        reloaded, _ = storage.load()
+        reloaded_addresses = {
+            h.name: h.address for loc in reloaded for room in loc.rooms for h in room.hosts
+        }
+        assert reloaded_addresses[host_to_edit.name] == "10.99.9.9", (
+            "an edit must survive a fresh storage.load() (simulated restart)"
+        )
+
+        # A locally-executing ssh option must be refused at the form, with
+        # the form staying open - never saved.
+        app.run_worker(app._edit_host())
+        await _wait_until(pilot, _modal_open)
+        app.screen.query_one("#f-ssh-args", Input).value = "-o ProxyCommand=evil"
+        app.screen.query_one("#form-add", Button).press()
+        await pilot.pause()
+        assert _modal_open(), "a forbidden ssh option must keep the form open"
+        app.screen.query_one("#form-cancel", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert next(
+            h for h in edit_room.hosts if h.name == host_to_edit.name
+        ).ssh_args == ("-o", "KexAlgorithms=+diffie-hellman-group14-sha1"), (
+            "the rejected edit must not have changed anything"
+        )
+
+        # --- edit room: rename keeps every host it contains ---------------
+        room_before = app._current_room
+        room_hosts_before = room_before.hosts
+        app.run_worker(app._edit_selected_tree_node())
+        await _wait_until(pilot, _modal_open)
+        assert app.screen.query_one("#f-name", Input).value == room_before.name, (
+            "the edit-room form must open prefilled"
+        )
+        app.screen.query_one("#f-name", Input).value = room_before.name + " East"
+        app.screen.query_one("#form-add", Button).press()
+        await _wait_until(pilot, _modal_closed)
+        assert app._current_room is not room_before, "edit replaces the frozen Room"
+        assert app._current_room.name == room_before.name + " East"
+        assert app._current_room.hosts is room_hosts_before, (
+            "renaming a room must carry its hosts list along untouched"
+        )
+
         # --- delete host: Cancel must protect, Delete must remove --------
         host_before = app._highlighted_host()
         room_ref = app._current_room
@@ -447,6 +567,35 @@ async def main() -> None:
         assert host_before.name not in reloaded_names, (
             "deleted host must also be gone from a fresh storage.load() (simulated restart)"
         )
+
+        # --- Quick Connect (Ctrl+F): one palette searching every host in
+        # every location at once; Enter connects the top match ------------
+        opened_before_qc = len(opened)
+        app.action_quick_connect()
+        await _wait_until(pilot, _modal_open)
+        qc_input = app.screen.query_one("#qc-input", Input)
+        qc_input.value = "b25-fw"
+        await pilot.pause()
+        from jumpbox.app import QuickConnectItem
+
+        qc_items = [
+            item for item in app.screen.query(QuickConnectItem)
+        ]
+        assert qc_items and qc_items[0].host.name == "us1-b25-fw1", (
+            f"searching 'b25-fw' should surface us1-b25-fw1 first, got "
+            f"{[i.host.name for i in qc_items]}"
+        )
+        assert qc_items[0].location.name == "B25", (
+            "the match must carry its own location, regardless of what the "
+            "Dashboard has selected"
+        )
+        await pilot.press("enter")
+        await _wait_until(pilot, _modal_closed)
+        await _wait_until(pilot, lambda: len(opened) == opened_before_qc + 1)
+        assert app.activity[0].host.name == "us1-b25-fw1", (
+            "Enter in Quick Connect should connect the highlighted host"
+        )
+        assert app.activity[0].location.name == "B25"
 
         # --- the "..." menu itself: opens and a plain Cancel is a no-op ---
         app.query_one("#location-menu-btn", Button).press()
@@ -480,6 +629,20 @@ async def main() -> None:
             )
     finally:
         del os.environ["TMUX"]
+
+    # --- Dashboard split at host-pane width: once a host pane is open,
+    # Jumpbox's own tmux pane is down to ~40% of the terminal - the hosts
+    # panel must get the *bigger* share of what's left, never be squeezed
+    # into wrapped rows by a fixed-width locations panel.
+    narrow_app = JumpboxApp()
+    async with narrow_app.run_test(size=(76, 45)) as narrow_pilot:
+        await narrow_pilot.pause()
+        locations_width = narrow_app.query_one("#locations-pane").region.width
+        hosts_width = narrow_app.query_one("#hosts-pane").region.width
+        assert hosts_width >= locations_width, (
+            f"at a split-pane width the hosts panel ({hosts_width}) must be at "
+            f"least as wide as locations ({locations_width})"
+        )
 
     # connect_command() is a single direct hop - every pane already runs on
     # this box, which is the only reason any of these hosts are reachable
@@ -560,8 +723,22 @@ async def main() -> None:
             port=22,
             description=f"`touch {marker_name}`",
             status=Status.ONLINE,
+            # ssh options are the one field where quoting alone isn't
+            # enough: ProxyCommand would make *ssh itself* run this. It
+            # must be stripped from the command outright (hand-edited
+            # JSON never passes through the form's validation).
+            ssh_args=("-v", "-o", f"ProxyCommand=touch {marker_name}"),
         )
         evil_command = connect_command(evil)
+        assert "proxycommand" not in evil_command.lower(), (
+            "a locally-executing ssh option must be stripped, not just quoted"
+        )
+        assert " -v " in evil_command, (
+            "stripping a forbidden option must keep the harmless args around it"
+        )
+        assert not evil_command.rstrip().endswith("-o"), (
+            "stripping an option's value must take its -o flag with it"
+        )
 
         env = {**os.environ, "PATH": f"{work_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
         subprocess.run(
@@ -590,6 +767,211 @@ async def main() -> None:
     backups = list(path.parent.glob(f"{path.name}.bad-*"))
     assert backups, "corrupt file should be renamed aside, not deleted"
 
+    # --- per-host ssh options: allowed ones flow through quoted, locally-
+    # executing ones are refused/stripped, site-wide ones come first ------
+    from jumpbox.connect import safe_ssh_args, ssh_args_error
+
+    assert ssh_args_error(["-o", "ProxyCommand=evil"]) is not None
+    assert ssh_args_error(["-oProxyCommand=evil"]) is not None, (
+        "the glued -oOption form must be caught too"
+    )
+    assert ssh_args_error(["-o", "LocalCommand=evil"]) is not None
+    assert ssh_args_error(["-o", "KexAlgorithms=+diffie-hellman-group14-sha1"]) is None
+    assert safe_ssh_args(("-v", "-o", "ProxyCommand=x", "-4")) == ("-v", "-4")
+
+    plain_host = load_inventory()[0].rooms[0].hosts[0]
+    with_base = connect_command(plain_host, ("-o", "ConnectTimeout=5"))
+    assert "ConnectTimeout=5" in with_base and with_base.endswith(
+        shlex.quote(plain_host.target)
+    ), f"config.json's site-wide ssh options should apply to every host: {with_base!r}"
+
+    # --- bulk CSV import/export ------------------------------------------
+    from jumpbox import bulk
+    from jumpbox.storage import Config
+
+    def _all_hosts(locations):
+        return {
+            h.name: (loc.name, room.name, h)
+            for loc in locations
+            for room in loc.rooms
+            for h in room.hosts
+        }
+
+    demo = load_inventory()
+    demo_tags = sorted(DEFAULT_TAGS)
+    demo_host_count = len(_all_hosts(demo))
+    bulk_dir = Path(tempfile.mkdtemp(prefix="jumpbox-bulk-"))
+    try:
+        # The starter template must itself be importable: its two example
+        # rows match demo hosts by name - one updates in place, one has a
+        # different room and must *move* there, never duplicate.
+        template_path = bulk_dir / "template.csv"
+        bulk.write_template(template_path)
+        merged, merged_tags, report = bulk.import_csv(template_path, demo, demo_tags)
+        assert report.total_rows == 2 and not report.skipped, report.summary()
+        assert len(report.updated) == 1 and len(report.moved) == 1 and not report.added, (
+            f"template rows must merge with the demo data, got: {report.summary()}"
+        )
+        assert len(_all_hosts(merged)) == demo_host_count, (
+            "a merge re-import must never duplicate hosts"
+        )
+        assert len(_all_hosts(demo)) == demo_host_count, (
+            "import_csv must never mutate its inputs"
+        )
+
+        # A messy real-world CSV: blank optional cells fall back to
+        # config.json defaults, and each broken row is skipped with a
+        # reason - never aborting the good rows around it.
+        messy_path = bulk_dir / "messy.csv"
+        messy_path.write_text(
+            "location,room,name,address,username,port,os,status,description,tags,ssh_args\n"
+            "NewSite,MDF,new-sw1,10.99.0.2,,,,,,switch brand-new-tag,\n"
+            "NewSite,MDF,bad-port,10.99.0.3,admin,not-a-port,,,,,\n"
+            "NewSite,MDF,,10.99.0.4,admin,,,,,,\n"
+            "NewSite,MDF,new-sw1,10.99.0.5,admin,,,,,,\n"
+            "NewSite,MDF,evil,10.99.0.6,admin,,,,,,-o ProxyCommand=x\n"
+            "NewSite,MDF,bad-status,10.99.0.7,admin,,,gone,,,\n"
+            "A14,Fab 1,us1-b14-sw1,10.14.1.99,,,,,,,\n",
+            encoding="utf-8",
+        )
+        cfg = Config(default_username="netops")
+        messy_result, messy_tags, messy_report = bulk.import_csv(
+            messy_path, demo, demo_tags, config=cfg
+        )
+        assert len(messy_report.added) == 1, messy_report.summary()
+        assert len(messy_report.updated) == 1, messy_report.summary()
+        assert len(messy_report.skipped) == 5, messy_report.summary()
+        skip_reasons = " | ".join(reason for _, reason in messy_report.skipped)
+        assert "port" in skip_reasons and "duplicate" in skip_reasons, skip_reasons
+        assert "local command" in skip_reasons, (
+            f"forbidden ssh options must be refused at import: {skip_reasons}"
+        )
+        assert "status" in skip_reasons, skip_reasons
+        assert messy_report.new_locations == ["NewSite"], messy_report.summary()
+        assert "brand-new-tag" in messy_tags, (
+            "tags on imported hosts must join the vocabulary"
+        )
+        hosts_after = _all_hosts(messy_result)
+        added_host = hosts_after["new-sw1"][2]
+        assert added_host.username == "netops", (
+            "a blank username cell must fall back to config.json's default"
+        )
+        assert added_host.port == 22 and added_host.os == "Linux"
+        updated_host = hosts_after["us1-b14-sw1"][2]
+        assert updated_host.address == "10.14.1.99", "the update row must apply"
+        assert updated_host.username == "netadmin" and updated_host.tags == ("switch",), (
+            "blank cells on an update must keep the existing values, not clear them"
+        )
+
+        # Export -> import --replace is a lossless round trip.
+        export_path = bulk_dir / "export.csv"
+        exported_count = bulk.export_csv(export_path, messy_result)
+        assert exported_count == len(hosts_after)
+        rebuilt, _rebuilt_tags, rebuilt_report = bulk.import_csv(
+            export_path, [], [], replace=True
+        )
+        assert rebuilt_report.replace and not rebuilt_report.skipped
+        assert rebuilt == messy_result, (
+            "export -> import --replace must reproduce the inventory exactly"
+        )
+
+        # A CSV missing required columns fails loudly up front.
+        bad_header = bulk_dir / "bad-header.csv"
+        bad_header.write_text("name,address\nx,10.0.0.1\n", encoding="utf-8")
+        try:
+            bulk.import_csv(bad_header, demo, demo_tags)
+            raise AssertionError("a header missing required columns must raise")
+        except ValueError as exc:
+            assert "location" in str(exc)
+    finally:
+        shutil.rmtree(bulk_dir, ignore_errors=True)
+
+    # --- every save rotates numbered backups (newest = .1, capped) -------
+    for _ in range(storage.BACKUP_COUNT + 2):
+        storage.save(demo, demo_tags)
+    rotated = sorted(
+        p.name for p in path.parent.glob(f"{path.name}.[0-9]")
+    )
+    assert rotated == [
+        f"{path.name}.{n}" for n in range(1, storage.BACKUP_COUNT + 1)
+    ], f"expected exactly .1..{storage.BACKUP_COUNT}, got {rotated}"
+    newest_backup = json.loads((path.parent / f"{path.name}.1").read_text(encoding="utf-8"))
+    assert newest_backup["locations"], ".1 must be a real previous inventory state"
+
+    # --- connection history counts and survives reloads ------------------
+    storage.record_connection("history-check")
+    history = storage.record_connection("history-check")
+    assert history["history-check"]["count"] == 2
+    assert storage.load_history()["history-check"]["count"] == 2
+
+    # --- config.json: real values read, missing keys keep defaults -------
+    config = storage.load_config()
+    assert config.probe_interval == 0, "this test's config.json turns probing off"
+    assert config.default_port == 22 and config.default_os == "Linux", (
+        "keys missing from config.json must keep their defaults"
+    )
+
+    # --- live status probes, against real local sockets ------------------
+    # A listening port is ONLINE; the same port once closed is DEGRADED
+    # (host answered, port refused); an unroutable address is OFFLINE.
+    from jumpbox.connect import probe
+
+    probe_server = await asyncio.start_server(
+        lambda reader, writer: writer.close(), "127.0.0.1", 0
+    )
+    probe_port = probe_server.sockets[0].getsockname()[1]
+    assert await probe("127.0.0.1", probe_port, 2.0) is Status.ONLINE
+    probe_server.close()
+    await probe_server.wait_closed()
+    assert await probe("127.0.0.1", probe_port, 2.0) is Status.DEGRADED
+    assert await probe("10.255.255.1", 1, 0.3) is Status.OFFLINE
+
+    # --- the CLI: template -> dry-run -> import -> export, in its own
+    # data dir, driving the real argparse entry point ---------------------
+    cli_data_dir = tempfile.mkdtemp(prefix="jumpbox-cli-")
+    try:
+        cli_env = {**os.environ, "JUMPBOX_DATA_DIR": cli_data_dir}
+        cli_csv = str(Path(cli_data_dir) / "hosts.csv")
+
+        def _cli(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, "-m", "jumpbox", *args],
+                capture_output=True,
+                text=True,
+                env=cli_env,
+                timeout=60,
+            )
+
+        result = _cli("template", cli_csv)
+        assert result.returncode == 0 and Path(cli_csv).exists(), result.stderr
+
+        result = _cli("import", cli_csv, "--dry-run")
+        assert result.returncode == 0 and "Dry run" in result.stdout, result.stdout
+        dry_inventory = json.loads(
+            (Path(cli_data_dir) / "inventory.json").read_text(encoding="utf-8")
+        )
+
+        result = _cli("import", cli_csv)
+        assert result.returncode == 0 and "Saved to" in result.stdout, result.stdout
+        real_inventory = json.loads(
+            (Path(cli_data_dir) / "inventory.json").read_text(encoding="utf-8")
+        )
+        assert real_inventory != dry_inventory, (
+            "the real import must change what the dry run didn't"
+        )
+
+        export_csv_path = str(Path(cli_data_dir) / "export.csv")
+        result = _cli("export", export_csv_path)
+        assert result.returncode == 0 and "28 hosts" in result.stdout, result.stdout
+        result = _cli("export", export_csv_path)
+        assert result.returncode != 0, (
+            "export onto an existing file must refuse without --force"
+        )
+        result = _cli("export", export_csv_path, "--force")
+        assert result.returncode == 0, result.stderr
+    finally:
+        shutil.rmtree(cli_data_dir, ignore_errors=True)
+
     print(
         "SMOKE OK — theme, locations/rooms tree (no dup hosts), fuzzy search "
         "(including locations matched by a room name like IDF/MDF), room "
@@ -599,9 +981,17 @@ async def main() -> None:
         "exit-only Activity reconciliation (closed entries kept as "
         "history), mouse-mode detection, per-login session isolation, "
         "direct (no-jump) connect commands, forwarded-agent detection, "
-        "Activity timestamps, quit button, add/delete with confirmation "
-        "(including tagged hosts), persistence across restarts, "
-        "corrupt-file recovery, and connect-command injection safety all good."
+        "Activity timestamps, quit button, add/edit/delete with "
+        "confirmation (including tagged hosts, prefilled edit forms, and "
+        "room renames keeping their hosts), persistence across restarts, "
+        "corrupt-file recovery, connect-command injection safety (host "
+        "fields AND ssh options), per-host/site-wide ssh options, Quick "
+        "Connect palette, connection history (in-app + on disk), rotating "
+        "inventory backups, config.json defaults, live status probes "
+        "against real sockets, bulk CSV import/export (merge, move, "
+        "skip-with-reason, config-default fallback, lossless "
+        "replace round trip, bad-header refusal), and the "
+        "template/import/export CLI all good."
     )
 
 
