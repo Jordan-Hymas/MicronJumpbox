@@ -32,19 +32,29 @@ single click previews a host's details; a double click (or Enter, or F2, or
 the Connect button) opens it as a new tmux pane - the first one splits off to
 the right of Jumpbox's own pane, every one after that stacks below the last,
 and this dashboard never leaves the screen. See `panes.py` for the mechanism.
+
+Beyond the three tabs: Ctrl+F opens the Quick Connect palette (fuzzy
+search over every host in every location at once, Enter connects); the
+"+" menus add/edit/delete locations, rooms, and hosts (edit opens the
+same form prefilled); a background sweep TCP-probes every host's ssh port
+so the status dots reflect live reachability (config.json's
+probe_interval, 0 = off); and each connect is recorded to a persistent
+per-host history (last connected / count), shown in the detail panel.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     Footer,
@@ -59,7 +69,7 @@ from textual.widgets import (
 )
 
 from . import fuzzy, panes, storage
-from .connect import connect_command, forwarded_agent_available
+from .connect import connect_command, forwarded_agent_available, probe
 from .data import Host, Location, Room, Status
 from .dialogs import (
     ActionMenu,
@@ -112,6 +122,32 @@ LOCATION_PALETTE = [
 ]
 
 MAX_ACTIVITY_ENTRIES = 20
+
+# How many hosts a live-status sweep probes at once. Bounded so a
+# thousand-host inventory doesn't open a thousand simultaneous sockets
+# from the bastion.
+PROBE_CONCURRENCY = 16
+
+
+def _ago(iso_timestamp: str) -> str | None:
+    """A compact 'how long ago' for a stored ISO timestamp - '3m ago',
+    '2h ago', '5d ago' - or None if the value is unparseable."""
+    try:
+        then = datetime.fromisoformat(iso_timestamp)
+    except (TypeError, ValueError):
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - then).total_seconds()
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
 
 
 def _location_label(location: Location, color_index: int) -> str:
@@ -264,18 +300,140 @@ class ActivityItem(ListItem):
         yield Static(_activity_label(self.entry), classes="activity-label")
 
 
+class QuickConnectItem(ListItem):
+    """One search result in the Quick Connect palette."""
+
+    def __init__(
+        self, location: Location, room: Room, host: Host, last_connected: str | None
+    ) -> None:
+        super().__init__(classes="qc-item")
+        self.location = location
+        self.room = room
+        self.host = host
+        self._last_connected = last_connected
+
+    def compose(self) -> ComposeResult:
+        color = STATUS_COLOR[self.host.status]
+        suffix = f"  [dim]· {self._last_connected}[/]" if self._last_connected else ""
+        yield Static(
+            f"{self.location.icon} [dim]{self.location.name} → {self.room.name}[/]  "
+            f"[{color}]●[/] [{color}]{self.host.name}[/]  "
+            f"[dim]{self.host.address}[/]{suffix}"
+        )
+
+
+class QuickConnectDialog(ModalScreen["tuple[Location, Room, Host] | None"]):
+    """Ctrl+F from anywhere: fuzzy-search every host in the whole
+    inventory at once - no drilling into a location and room first - and
+    hit Enter to connect to the top match. The answer to "I know the
+    hostname, no idea which building it's in" once the inventory is
+    hundreds of hosts.
+
+    Resolves to the chosen (location, room, host), or None on Escape; the
+    caller does the actual connecting, exactly like any other host row.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_quick", "Cancel", show=False),
+        Binding("down", "focus_results", "Results", show=False),
+    ]
+
+    MAX_RESULTS = 30
+
+    def __init__(self, locations: list[Location], history: dict[str, dict]) -> None:
+        super().__init__()
+        self._entries = [
+            (location, room, host)
+            for location in locations
+            for room in location.rooms
+            for host in room.hosts
+        ]
+        self._history = history
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog-box wide", id="qc-box"):
+            yield Static("Quick Connect", classes="dialog-title")
+            yield Input(placeholder="Type to search every host everywhere…", id="qc-input")
+            yield ListView(id="qc-list")
+            yield Static(
+                "[dim]Enter connects the highlighted host · Esc cancels[/]",
+                id="qc-hint",
+            )
+
+    async def on_mount(self) -> None:
+        await self._populate("")
+        self.query_one("#qc-input", Input).focus()
+
+    async def _populate(self, query: str) -> None:
+        matches = fuzzy.filter_items(
+            query,
+            self._entries,
+            key=lambda entry: [
+                entry[2].search_text,
+                f"{entry[0].name} {entry[1].name} {entry[2].name}",
+            ],
+        )[: self.MAX_RESULTS]
+        view = self.query_one("#qc-list", ListView)
+        await view.clear()
+        if not matches:
+            await view.append(ListItem(Static("[dim]No hosts match.[/]")))
+            return
+        await view.extend(
+            QuickConnectItem(
+                location,
+                room,
+                host,
+                _ago((self._history.get(host.name) or {}).get("last_connected", "")),
+            )
+            for location, room, host in matches
+        )
+        view.index = 0
+
+    def action_dismiss_quick(self) -> None:
+        self.dismiss(None)
+
+    def action_focus_results(self) -> None:
+        self.query_one("#qc-list", ListView).focus()
+
+    @on(Input.Changed, "#qc-input")
+    async def _on_query_changed(self, event: Input.Changed) -> None:
+        await self._populate(event.value)
+
+    @on(Input.Submitted, "#qc-input")
+    def _on_query_submitted(self) -> None:
+        self._choose_highlighted()
+
+    @on(ListView.Selected, "#qc-list")
+    def _on_result_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, QuickConnectItem):
+            self.dismiss((event.item.location, event.item.room, event.item.host))
+
+    def _choose_highlighted(self) -> None:
+        view = self.query_one("#qc-list", ListView)
+        item = view.highlighted_child
+        if not isinstance(item, QuickConnectItem):
+            # Enter straight from the input: take the top match if any.
+            children = [c for c in view.children if isinstance(c, QuickConnectItem)]
+            if not children:
+                return
+            item = children[0]
+        self.dismiss((item.location, item.room, item.host))
+
+
 class JumpboxApp(App):
     """Terminal jump host dashboard."""
 
     CSS_PATH = "styles.tcss"
-    TITLE = "🔐 Jumpbox"
+    TITLE = "Jumpbox"
     SUB_TITLE = "SSH Jump Host"
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+f", "quick_connect", "Quick connect"),
         Binding("/", "focus_host_search", "Find host"),
         Binding("ctrl+r", "focus_location_search", "Find location"),
         Binding("f2", "connect", "Connect"),
+        Binding("f4", "fullscreen", "Fullscreen host"),
         Binding("f5", "refresh", "Refresh"),
     ]
 
@@ -283,6 +441,10 @@ class JumpboxApp(App):
         super().__init__()
         self.locations: list[Location] = []
         self.tag_vocabulary: list[str] = []
+        self.config = storage.load_config()
+        # host name -> {"last_connected": ISO timestamp, "count": int},
+        # persisted across runs (storage.record_connection).
+        self.history: dict[str, dict] = {}
         self._current_location: Location | None = None
         self._current_room: Room | None = None
         self._current_tag: str | None = None
@@ -295,6 +457,8 @@ class JumpboxApp(App):
         self._window_id = ""
         # Lets us clear the host search box without re-triggering a search.
         self._suppress_host_search = False
+        # One live-status sweep at a time; a slow network can't stack them.
+        self._probe_running = False
 
     def notify(self, *args, **kwargs) -> None:
         """No-op: toast popups are disabled app-wide.
@@ -342,6 +506,9 @@ class JumpboxApp(App):
                                 yield Button(
                                     "▶ Connect", id="connect", variant="success"
                                 )
+                                yield Button(
+                                    "⛶ Fullscreen", id="fullscreen", disabled=True
+                                )
                                 yield Button("⟳ Refresh", id="refresh")
             with TabPane("🏷 Tags", id="tags"):
                 with Horizontal(id="tags-body"):
@@ -362,6 +529,9 @@ class JumpboxApp(App):
                     yield ListView(id="activity-list")
                     with Horizontal(id="activity-actions"):
                         yield Button("↺ Reconnect", id="reconnect-activity")
+                        yield Button(
+                            "⛶ Fullscreen", id="fullscreen-activity", disabled=True
+                        )
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -410,10 +580,14 @@ class JumpboxApp(App):
             )
 
         self.locations, self.tag_vocabulary = storage.load()
+        self.history = storage.load_history()
         await self._populate_locations()
         await self._populate_tags()
         await self._populate_activity()
         self.set_interval(1.0, self._reconcile_activity)
+        if self.config.probe_interval > 0:
+            self._start_status_probe()
+            self.set_interval(self.config.probe_interval, self._start_status_probe)
 
     # --------------------------------------------------------------- populate
     async def _populate_locations(self, query: str = "") -> None:
@@ -467,6 +641,12 @@ class JumpboxApp(App):
 
     async def _populate_hosts(self, query: str = "") -> None:
         view = self.query_one("#hosts", ListView)
+        # Remember which host was highlighted so a rebuild that still
+        # contains it (a status sweep repainting dots, an edit elsewhere)
+        # puts the cursor back rather than yanking it to the top. A room
+        # switch naturally won't find the old name and starts at 0.
+        previous = view.highlighted_child
+        previous_name = previous.host.name if isinstance(previous, HostItem) else None
         await view.clear()
         hosts: list[Host] = []
         if self._current_room is not None:
@@ -478,8 +658,11 @@ class JumpboxApp(App):
                 for host in hosts
             )
         if hosts:
-            view.index = 0
-            self._show_detail(hosts[0])
+            index = next(
+                (i for i, host in enumerate(hosts) if host.name == previous_name), 0
+            )
+            view.index = index
+            self._show_detail(hosts[index])
         else:
             self._show_detail(None)
 
@@ -586,10 +769,19 @@ class JumpboxApp(App):
         connect.disabled = False
         color = STATUS_COLOR[host.status]
         tags = " ".join(f"[dim]#{t}[/]" for t in host.tags)
+        entry = self.history.get(host.name) or {}
+        last = _ago(entry.get("last_connected", ""))
+        history_note = ""
+        if last:
+            count = int(entry.get("count", 0))
+            history_note = (
+                f"   [dim]last connected {last}"
+                + (f" · {count} times[/]" if count > 1 else "[/]")
+            )
         body.update(
             f"[b]{host.name}[/]  [{color}]{host.status.label}[/]   "
             f"[dim]{host.username}@{host.address}:{host.port}[/]   "
-            f"[dim]{host.os}[/]\n"
+            f"[dim]{host.os}[/]{history_note}\n"
             f"[dim]{host.description}[/]   {tags}"
         )
 
@@ -664,12 +856,15 @@ class JumpboxApp(App):
         options = [("add-location", "Add Location")]
         if node is not None:
             options.append(("add-room", "Add Room"))
+            options.append(("edit", "Edit Selected"))
             options.append(("delete", "Delete Selected"))
         choice = await self.push_screen_wait(ActionMenu("Locations", options))
         if choice == "add-location":
             await self._add_location()
         elif choice == "add-room":
             await self._add_room()
+        elif choice == "edit":
+            await self._edit_selected_tree_node()
         elif choice == "delete":
             await self._delete_selected_tree_node()
 
@@ -678,10 +873,13 @@ class JumpboxApp(App):
     async def _on_host_menu_button(self) -> None:
         options = [("add-host", "Add Host")]
         if self._highlighted_host() is not None:
+            options.append(("edit", "Edit Selected"))
             options.append(("delete", "Delete Selected"))
         choice = await self.push_screen_wait(ActionMenu("Hosts", options))
         if choice == "add-host":
             await self._add_host()
+        elif choice == "edit":
+            await self._edit_host()
         elif choice == "delete":
             await self._delete_host()
 
@@ -713,6 +911,20 @@ class JumpboxApp(App):
         else:
             self.notify("No activity entry selected.", severity="warning")
 
+    @on(Button.Pressed, "#fullscreen")
+    def _on_fullscreen_button(self) -> None:
+        self.action_fullscreen()
+
+    @on(Button.Pressed, "#fullscreen-activity")
+    def _on_fullscreen_activity_button(self) -> None:
+        # Fullscreen the highlighted connection if it's still open;
+        # otherwise fall back to the most recently opened one, same as F4.
+        item = self.query_one("#activity-list", ListView).highlighted_child
+        if isinstance(item, ActivityItem) and item.entry.is_open:
+            self._fullscreen_pane(item.entry.pane_id, item.entry.host.name)
+        else:
+            self.action_fullscreen()
+
     @on(TabbedContent.TabActivated)
     async def _on_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.pane.id == "activity":
@@ -738,13 +950,62 @@ class JumpboxApp(App):
             return
         self._connect(host)
 
+    def action_fullscreen(self) -> None:
+        """Zoom the most recently opened still-open host pane to the whole
+        window (see panes.zoom_pane for how to get back: Ctrl+B then Z, or
+        the fullscreened session simply ending)."""
+        open_entries = [entry for entry in self.activity if entry.is_open]
+        if not open_entries:
+            self.notify("No open connection to fullscreen.", severity="warning")
+            return
+        entry = open_entries[0]
+        self._fullscreen_pane(entry.pane_id, entry.host.name)
+
+    def _fullscreen_pane(self, pane_id: str, host_name: str) -> None:
+        if self.tmux_session is None:
+            self.notify(
+                "No tmux session detected, so there's nothing to fullscreen.",
+                severity="error",
+            )
+            return
+        try:
+            panes.zoom_pane(pane_id)
+        except RuntimeError as exc:
+            self.notify(f"Couldn't fullscreen {host_name}: {exc}", severity="error")
+            return
+        self.notify(
+            f"{host_name} is fullscreen — Ctrl+B then Z brings the dashboard back.",
+            title="Jumpbox",
+        )
+
+    def _update_fullscreen_buttons(self) -> None:
+        """The two ⛶ buttons are only enabled while at least one
+        connection is open - with notifications disabled app-wide, the
+        disabled state is the visible cue that there's nothing to zoom."""
+        has_open = any(entry.is_open for entry in self.activity)
+        self.query_one("#fullscreen", Button).disabled = not has_open
+        self.query_one("#fullscreen-activity", Button).disabled = not has_open
+
+    @work
+    async def action_quick_connect(self) -> None:
+        result = await self.push_screen_wait(
+            QuickConnectDialog(self.locations, self.history)
+        )
+        if result is not None:
+            location, room, host = result
+            self._connect(host, location, room)
+
     async def action_refresh(self) -> None:
         self.locations, self.tag_vocabulary = storage.load()
+        self.config = storage.load_config()
+        self.history = storage.load_history()
         self._current_location = None
         self._current_room = None
         self.query_one("#location-search", Input).value = ""
         await self._populate_locations()
         await self._populate_tags(self.query_one("#tag-search", Input).value)
+        if self.config.probe_interval > 0:
+            self._start_status_probe()
         self.notify("Inventory refreshed.", title="Jumpbox")
 
     # ------------------------------------------------------------- add/remove
@@ -773,6 +1034,47 @@ class JumpboxApp(App):
         self._save()
         await self._populate_locations(self.query_one("#location-search", Input).value)
         self.notify(f"Added room '{result.name}' to {location.name}.", title="Jumpbox")
+
+    async def _edit_selected_tree_node(self) -> None:
+        """Edit whichever location or room the tree cursor is on. The form
+        returns a *new* frozen object carrying the old rooms/hosts lists,
+        so everything nested inside survives a rename untouched."""
+        node = self.query_one("#locations", Tree).cursor_node
+        if node is None:
+            self.notify("Nothing selected to edit.", severity="warning")
+            return
+
+        if isinstance(node.data, Location):
+            location = node.data
+            result = await self.push_screen_wait(LocationFormDialog(existing=location))
+            if result is None:
+                return
+            self.locations[self.locations.index(location)] = result
+            if self._current_location is location:
+                self._current_location = result
+            self._save()
+            await self._populate_locations(self.query_one("#location-search", Input).value)
+            self.notify(f"Updated location '{result.name}'.", title="Jumpbox")
+
+        elif isinstance(node.data, Room):
+            room = node.data
+            parent_location = self._node_location(node)
+            if parent_location is None:
+                return
+            result = await self.push_screen_wait(
+                RoomFormDialog(parent_location.name, existing=room)
+            )
+            if result is None:
+                return
+            parent_location.rooms[parent_location.rooms.index(room)] = result
+            if self._current_room is room:
+                self._current_room = result
+                self.query_one("#hosts-pane").border_title = (
+                    f"HOSTS  ·  {parent_location.name} → {result.name}"
+                )
+            self._save()
+            await self._populate_locations(self.query_one("#location-search", Input).value)
+            self.notify(f"Updated room '{result.name}'.", title="Jumpbox")
 
     async def _delete_selected_tree_node(self) -> None:
         node = self.query_one("#locations", Tree).cursor_node
@@ -825,7 +1127,9 @@ class JumpboxApp(App):
             self.notify("Select a room first.", severity="warning")
             return
         room = self._current_room
-        result = await self.push_screen_wait(HostFormDialog(room.name, self.tag_vocabulary))
+        result = await self.push_screen_wait(
+            HostFormDialog(room.name, self.tag_vocabulary, config=self.config)
+        )
         if result is None:
             return
         room.hosts.append(result)
@@ -834,6 +1138,26 @@ class JumpboxApp(App):
         await self._populate_locations(self.query_one("#location-search", Input).value)
         await self._populate_tags(self.query_one("#tag-search", Input).value)
         self.notify(f"Added host '{result.name}' to {room.name}.", title="Jumpbox")
+
+    async def _edit_host(self) -> None:
+        host = self._highlighted_host()
+        room = self._current_room
+        if host is None or room is None or host not in room.hosts:
+            self.notify("No host selected to edit.", severity="warning")
+            return
+        result = await self.push_screen_wait(
+            HostFormDialog(
+                room.name, self.tag_vocabulary, existing=host, config=self.config
+            )
+        )
+        if result is None:
+            return
+        room.hosts[room.hosts.index(host)] = result
+        self._save()
+        await self._populate_hosts(self.query_one("#host-search", Input).value)
+        await self._populate_locations(self.query_one("#location-search", Input).value)
+        await self._populate_tags(self.query_one("#tag-search", Input).value)
+        self.notify(f"Updated host '{result.name}'.", title="Jumpbox")
 
     async def _delete_host(self) -> None:
         host = self._highlighted_host()
@@ -938,15 +1262,79 @@ class JumpboxApp(App):
             stacked = False
 
         try:
-            new_pane_id = panes.open_pane(target_pane, connect_command(host), stacked=stacked)
+            new_pane_id = panes.open_pane(
+                target_pane,
+                connect_command(host, self.config.ssh_options),
+                stacked=stacked,
+            )
         except RuntimeError as exc:
             self.notify(f"Couldn't open a pane for {host.name}: {exc}", severity="error")
             return
 
         self.activity.insert(0, ActivityEntry(new_pane_id, host, location, room, datetime.now()))
         self._trim_activity()
+        self.history = storage.record_connection(host.name)
+        self._show_detail(self._highlighted_host())
+        self._update_fullscreen_buttons()
         self.run_worker(self._populate_activity())
         self.notify(f"Opened {host.name} in a new pane.", title="Jumpbox")
+
+    # ------------------------------------------------------------ live status
+    def _start_status_probe(self) -> None:
+        """Kick one background reachability sweep of every host's ssh port,
+        unless one is already running (a slow network can't stack them)."""
+        if self._probe_running or not self.locations:
+            return
+        self.run_worker(self._probe_all_hosts(), group="status-probe")
+
+    async def _probe_all_hosts(self) -> None:
+        """TCP-probe every host concurrently (bounded) and repaint whatever
+        actually changed. Statuses live only in memory until the next
+        save() - a sweep never writes the inventory file by itself.
+
+        `Status` used to be a decorative value set once at add-time; this
+        is what makes the green/yellow/red dots mean something: reachable
+        from this box right now, host up but port refusing, or no answer.
+        """
+        self._probe_running = True
+        try:
+            targets = [
+                (room, host)
+                for location in self.locations
+                for room in location.rooms
+                for host in room.hosts
+            ]
+            if not targets:
+                return
+            semaphore = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+            async def probe_one(host: Host) -> Status:
+                async with semaphore:
+                    return await probe(host.address, host.port, self.config.probe_timeout)
+
+            statuses = await asyncio.gather(
+                *(probe_one(host) for _room, host in targets)
+            )
+            changed = False
+            for (room, host), status in zip(targets, statuses):
+                if status is host.status:
+                    continue
+                try:
+                    # The inventory may have been edited mid-sweep; find the
+                    # host by identity and skip it if it's gone.
+                    index = room.hosts.index(host)
+                except ValueError:
+                    continue
+                room.hosts[index] = replace(host, status=status)
+                changed = True
+            if changed:
+                await self._populate_locations(
+                    self.query_one("#location-search", Input).value
+                )
+                await self._populate_hosts(self.query_one("#host-search", Input).value)
+                await self._populate_tags(self.query_one("#tag-search", Input).value)
+        finally:
+            self._probe_running = False
 
     def _trim_activity(self) -> None:
         """Cap closed history at MAX_ACTIVITY_ENTRIES, oldest closed entry
@@ -979,4 +1367,5 @@ class JumpboxApp(App):
             if entry.pane_id not in alive:
                 entry.closed_at = now
         self._trim_activity()
+        self._update_fullscreen_buttons()
         await self._populate_activity()

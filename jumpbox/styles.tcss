@@ -79,8 +79,18 @@ TabPane {
     padding: 0 2 1 2;
 }
 
+/* The two Dashboard panels share the width *proportionally* - hosts
+   always gets the bigger share (60/40) - instead of locations taking a
+   fixed 44 cells. With a host pane open, Jumpbox's own tmux pane is down
+   to ~40% of the terminal, and a fixed-width locations panel was leaving
+   the hosts list too narrow to show a host on one line (wrapped rows,
+   clipped buttons). Locations still caps out at 44 on a full-width
+   terminal, so unsplit it looks exactly like it always did. (40% +
+   max-width, not fr units: fr + max-width resolves inconsistently at
+   narrow widths.) */
 #locations-pane {
-    width: 44;
+    width: 40%;
+    max-width: 44;
     height: 1fr;
     border: round $primary;
     border-title-color: $accent;
@@ -381,6 +391,29 @@ ModalScreen {
 .dialog-actions Button {
     margin-left: 1;
     min-width: 10;
+}
+
+/* ---- quick connect (Ctrl+F palette) ------------------------------------
+   One search box over every host in the whole inventory at once; the
+   result list needs a real height (unlike the auto-sized forms) so the
+   palette doesn't jump around as matches narrow. */
+#qc-box {
+    height: 24;
+}
+
+#qc-list {
+    height: 1fr;
+    margin-bottom: 1;
+    background: $panel;
+}
+
+.qc-item {
+    height: 1;
+    padding: 0 1;
+}
+
+#qc-hint {
+    height: 1;
 }
 
 /* ---- action menu (the "+" popup) -------------------------------------- */

@@ -141,6 +141,20 @@ def open_pane(target_pane: str, command: str, *, stacked: bool) -> str:
     )
 
 
+def zoom_pane(pane_id: str) -> None:
+    """Fullscreen `pane_id`: tmux's zoom makes one pane temporarily take
+    over the whole window - the layout underneath is untouched, so
+    unzooming restores the exact split. Getting back out is tmux's own
+    zoom toggle (prefix+Z, i.e. Ctrl+B then Z), or just ending the
+    session in the zoomed pane (`exit`) - tmux unzooms automatically when
+    the zoomed pane closes, landing straight back on the dashboard.
+
+    select-pane first: -Z acts on a window's *active* pane, so targeting
+    an inactive one without selecting it would zoom the wrong pane."""
+    _tmux("select-pane", "-t", pane_id)
+    _tmux("resize-pane", "-Z", "-t", pane_id)
+
+
 def kill_session(session_name: str) -> None:
     subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
 
